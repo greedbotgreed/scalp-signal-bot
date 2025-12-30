@@ -3,339 +3,530 @@ import time
 import json
 import math
 import threading
-from typing import List, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
 
 import requests
+
 
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()
+TG_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
-# Binance Futures public REST
-BASE_URL = "https://data.binance.com"
-
+# Symbols (USDT Perp)
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "TONUSDT"]
 
 # Timeframes
-TF_TREND = "1h"   # trend filter
-TF_ENTRY = "15m"  # main entry timeframe
+TF_ENTRY = "15m"   # основний
+TF_TREND = "1h"    # фільтр тренду
 
 # Indicators
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN = 14
 
-# SL swing lookback on entry TF
-SWING_LOOKBACK = 12  # candles
-SL_BUFFER_PCT = 0.0015  # 0.15%
+# Risk/Targets (просте правило)
+R_MULT_TP1 = 1.0
+R_MULT_TP2 = 2.0
 
-# Loop / anti-spam
+# How often to scan (seconds)
 CHECK_EVERY_SEC = 60
-COOLDOWN_SEC = 6 * 60 * 60  # 6 hours per symbol+direction
+
+# Anti-spam
+COOLDOWN_SEC = 60 * 45          # мін. пауза між однаковими сетапами на символ
+MAX_ALERTS_PER_DAY = 7          # щоб було “5–7/день”
 STATE_FILE = "state.json"
 
-# Alert limiting (soft cap)
-MAX_ALERTS_PER_DAY = 8  # safety cap
-DAY_KEY = "day_count_utc"
+# Daily stats schedule
+LOCAL_TZ = timezone(timedelta(hours=2))   # UTC+2
+DAILY_REPORT_HOUR = 21
+DAILY_REPORT_MIN = 0
+
+# Binance data endpoint (важливо, щоб не ловити 451)
+BASE_URL = "https://data.binance.com"
+
+# HTTP
+HTTP_TIMEOUT = 12
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
 
 # =========================
-# Telegram
-# =========================
-def tg_send(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN or CHAT_ID")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    r = requests.post(url, json=payload, timeout=20)
-    if r.status_code != 200:
-        print("tg_send error:", r.status_code, r.text)
-
-# =========================
-# Data helpers
-# =========================
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> List[Dict]:
-    url = f"{BASE_URL}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    raw = r.json()
-    out = []
-    for k in raw:
-        out.append({
-            "open_time": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-            "close_time": int(k[6]),
-        })
-    return out
-
-def ema(values: List[float], length: int) -> List[float]:
-    if len(values) < length:
-        return []
-    k = 2 / (length + 1)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(out[-1] + k * (v - out[-1]))
-    return out
-
-def rsi(closes: List[float], length: int) -> List[float]:
-    if len(closes) < length + 1:
-        return []
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i - 1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-
-    # Wilder smoothing
-    avg_gain = sum(gains[:length]) / length
-    avg_loss = sum(losses[:length]) / length
-
-    out = [50.0] * (length)  # pad
-    for i in range(length, len(gains)):
-        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
-        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
-        if avg_loss == 0:
-            out.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            out.append(100.0 - (100.0 / (1.0 + rs)))
-    # align length with closes
-    while len(out) < len(closes):
-        out.insert(0, 50.0)
-    return out[-len(closes):]
-
-def fmt_price(x: float, symbol: str) -> str:
-    # simple formatting by typical price magnitude
-    if symbol.startswith("BTC"):
-        return f"{x:,.1f}"
-    if x >= 100:
-        return f"{x:,.2f}"
-    if x >= 1:
-        return f"{x:,.4f}"
-    return f"{x:,.6f}"
-
-# =========================
-# State (cooldown / daily cap)
+# STORAGE
 # =========================
 def load_state() -> Dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {
+            "last_sent": {},        # key -> ts
+            "daily": {},            # yyyy-mm-dd -> {"count": int}
+            "signals": [],          # list of signals for stats
+            "last_report_date": None
+        }
+
 
 def save_state(state: Dict) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except Exception as e:
-        print("save_state error:", e)
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-def utc_day() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-def can_alert_today(state: Dict) -> bool:
-    day = utc_day()
-    if state.get(DAY_KEY) != day:
-        state[DAY_KEY] = day
-        state["alerts_today"] = 0
-    return state.get("alerts_today", 0) < MAX_ALERTS_PER_DAY
-
-def inc_alert_today(state: Dict) -> None:
-    state["alerts_today"] = int(state.get("alerts_today", 0)) + 1
-
-def cooldown_key(symbol: str, direction: str) -> str:
-    return f"cooldown::{symbol}::{direction}"
-
-def in_cooldown(state: Dict, symbol: str, direction: str) -> bool:
-    k = cooldown_key(symbol, direction)
-    last = float(state.get(k, 0))
-    return (time.time() - last) < COOLDOWN_SEC
-
-def mark_cooldown(state: Dict, symbol: str, direction: str) -> None:
-    state[cooldown_key(symbol, direction)] = time.time()
 
 # =========================
-# Strategy
+# TELEGRAM
 # =========================
-def compute_setup(symbol: str) -> Optional[Dict]:
-    # fetch data
-    trend = fetch_klines(symbol, TF_TREND, 200)
-    entry = fetch_klines(symbol, TF_ENTRY, 200)
-
-    trend_closes = [c["close"] for c in trend]
-    entry_closes = [c["close"] for c in entry]
-    entry_highs = [c["high"] for c in entry]
-    entry_lows = [c["low"] for c in entry]
-
-    ema_fast_tr = ema(trend_closes, EMA_FAST)
-    ema_slow_tr = ema(trend_closes, EMA_SLOW)
-
-    ema_fast_en = ema(entry_closes, EMA_FAST)
-    ema_slow_en = ema(entry_closes, EMA_SLOW)
-    rsi_en = rsi(entry_closes, RSI_LEN)
-
-    if not ema_fast_tr or not ema_slow_tr or not ema_fast_en or not ema_slow_en or not rsi_en:
-        return None
-
-    # current values
-    tr_fast = ema_fast_tr[-1]
-    tr_slow = ema_slow_tr[-1]
-
-    en_fast = ema_fast_en[-1]
-    en_slow = ema_slow_en[-1]
-    r0 = rsi_en[-1]
-    r1 = rsi_en[-2] if len(rsi_en) >= 2 else r0
-
-    last_close = entry_closes[-1]
-    last_low = entry_lows[-1]
-    last_high = entry_highs[-1]
-
-    # trend direction
-    if tr_fast > tr_slow:
-        direction = "LONG"
-    elif tr_fast < tr_slow:
-        direction = "SHORT"
-    else:
-        return None
-
-    # distance to EMA50 (entry timeframe)
-    dist_to_ema50 = abs(last_close - en_slow) / en_slow
-
-    # We want "near EMA50" pullback. 0.35% default.
-    near_ema = dist_to_ema50 <= 0.0035
-
-    # RSI "turn"
-    # LONG: RSI rising and coming out of low zone
-    # SHORT: RSI falling and coming down from high zone
-    if direction == "LONG":
-        rsi_ok = (r0 > r1) and (r0 >= 32) and (r1 <= 35)
-    else:
-        rsi_ok = (r0 < r1) and (r0 <= 68) and (r1 >= 65)
-
-    # structure filter: price not totally against EMA20 on entry TF
-    if direction == "LONG":
-        struct_ok = last_close >= en_fast * 0.995
-    else:
-        struct_ok = last_close <= en_fast * 1.005
-
-    if not (near_ema and rsi_ok and struct_ok):
-        return None
-
-    # SL by swing
-    if len(entry_lows) < SWING_LOOKBACK + 2:
-        return None
-
-    if direction == "LONG":
-        swing = min(entry_lows[-(SWING_LOOKBACK + 1):-1])
-        sl = swing * (1 - SL_BUFFER_PCT)
-        entry_zone = (en_slow * 0.999, en_slow * 1.001)  # tight zone around EMA50
-        entry_ref = last_close
-        risk = max(entry_ref - sl, entry_ref * 0.002)  # avoid tiny risk
-        tp1 = entry_ref + risk * 1.0
-        tp2 = entry_ref + risk * 2.0
-        invalid = f"Сценарій скасовано, якщо ціна закріпиться нижче {fmt_price(sl, symbol)}"
-    else:
-        swing = max(entry_highs[-(SWING_LOOKBACK + 1):-1])
-        sl = swing * (1 + SL_BUFFER_PCT)
-        entry_zone = (en_slow * 0.999, en_slow * 1.001)
-        entry_ref = last_close
-        risk = max(sl - entry_ref, entry_ref * 0.002)
-        tp1 = entry_ref - risk * 1.0
-        tp2 = entry_ref - risk * 2.0
-        invalid = f"Сценарій скасовано, якщо ціна закріпиться вище {fmt_price(sl, symbol)}"
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "tf": TF_ENTRY,
-        "trend_tf": TF_TREND,
-        "price": entry_ref,
-        "ema50": en_slow,
-        "rsi": r0,
-        "entry_zone": entry_zone,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "invalid": invalid,
-        "ts": int(time.time()),
+def tg_send(text: str) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("TG creds missing (BOT_TOKEN/CHAT_ID).")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
     }
+    try:
+        r = SESSION.post(url, json=payload, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            print("TG send error:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("TG exception:", e)
 
-def format_signal(sig: Dict) -> str:
+
+# =========================
+# BINANCE DATA
+# =========================
+def _safe_get(path: str, params: Dict) -> Optional[dict]:
+    url = f"{BASE_URL}{path}"
+    for attempt in range(4):
+        try:
+            r = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            # простий backoff
+            if r.status_code in (418, 429, 500, 502, 503, 504):
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            print("Binance HTTP:", r.status_code, r.text[:180])
+            return None
+        except Exception as e:
+            print("Binance exception:", e)
+            time.sleep(1.2 * (attempt + 1))
+    return None
+
+
+def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[List[List]]:
+    data = _safe_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    if isinstance(data, list):
+        return data
+    return None
+
+
+# =========================
+# INDICATORS
+# =========================
+def ema(values: List[float], period: int) -> List[float]:
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = []
+    # start with SMA
+    sma = sum(values[:period]) / period
+    out.append(sma)
+    prev = sma
+    for v in values[period:]:
+        prev = v * k + prev * (1 - k)
+        out.append(prev)
+    # align to original length (prepend Nones)
+    pad = [math.nan] * (period - 1)
+    return pad + out
+
+
+def rsi(values: List[float], period: int) -> List[float]:
+    if len(values) < period + 1:
+        return []
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    out = [math.nan] * period
+    def rs_to_rsi(rs: float) -> float:
+        return 100 - (100 / (1 + rs))
+
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
+    out.append(rs_to_rsi(rs))
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
+        out.append(rs_to_rsi(rs))
+
+    # out length == len(values)
+    return out
+
+
+def to_ohlc(klines: List[List]) -> Tuple[List[int], List[float], List[float], List[float], List[float]]:
+    ts = [int(k[0]) for k in klines]
+    o = [float(k[1]) for k in klines]
+    h = [float(k[2]) for k in klines]
+    l = [float(k[3]) for k in klines]
+    c = [float(k[4]) for k in klines]
+    return ts, o, h, l, c
+
+
+# =========================
+# SETUP LOGIC
+# =========================
+def trend_filter_1h(symbol: str) -> Optional[str]:
+    kl = get_klines(symbol, TF_TREND, 220)
+    if not kl:
+        return None
+    _, _, _, _, c = to_ohlc(kl)
+
+    e20 = ema(c, EMA_FAST)
+    e50 = ema(c, EMA_SLOW)
+    if len(e20) != len(c) or len(e50) != len(c):
+        return None
+
+    last = len(c) - 1
+    if math.isnan(e20[last]) or math.isnan(e50[last]):
+        return None
+
+    # simple filter
+    if e20[last] > e50[last]:
+        return "LONG"
+    if e20[last] < e50[last]:
+        return "SHORT"
+    return None
+
+
+def make_setup(symbol: str) -> Optional[Dict]:
+    # trend
+    trend = trend_filter_1h(symbol)
+    if not trend:
+        return None
+
+    # entry TF
+    kl = get_klines(symbol, TF_ENTRY, 300)
+    if not kl:
+        return None
+    ts, o, h, l, c = to_ohlc(kl)
+
+    e20 = ema(c, EMA_FAST)
+    e50 = ema(c, EMA_SLOW)
+    r = rsi(c, RSI_LEN)
+    if not e20 or not e50 or not r:
+        return None
+
+    i = len(c) - 2  # беремо передостанню свічку, щоб не ловити “недозакриту”
+    price = c[i]
+    if any(math.isnan(x) for x in [e20[i], e50[i], r[i]]):
+        return None
+
+    # Distance to EMA50 (mean reversion area)
+    dist = abs(price - e50[i]) / price
+
+    # Swing for SL (lookback)
+    lookback = 20
+    low_swing = min(l[i - lookback:i]) if i - lookback >= 0 else min(l[:i])
+    high_swing = max(h[i - lookback:i]) if i - lookback >= 0 else max(h[:i])
+
+    # Entry “zone” around EMA20/50
+    entry_low = min(e20[i], e50[i]) * 0.999
+    entry_high = max(e20[i], e50[i]) * 1.001
+
+    # TRIGGERS (чітко і зрозуміло)
+    # LONG: тренд LONG + RSI>50 і ціна не “занадто далеко” від EMA50
+    # SHORT: тренд SHORT + RSI<50 і ціна не “занадто далеко” від EMA50
+    if trend == "LONG":
+        if r[i] < 50:
+            return None
+        if dist > 0.018:  # ~1.8%
+            return None
+
+        sl = low_swing * 0.999  # трохи нижче свінгу
+        risk = max(price - sl, price * 0.002)  # мінімальний R
+        tp1 = price + risk * R_MULT_TP1
+        tp2 = price + risk * R_MULT_TP2
+
+        return {
+            "symbol": symbol,
+            "tf": TF_ENTRY,
+            "dir": "LONG",
+            "trend_tf": TF_TREND,
+            "price": price,
+            "entry_zone": (entry_low, entry_high),
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "ts": int(ts[i]),
+            "rsi": r[i],
+            "ema20": e20[i],
+            "ema50": e50[i],
+        }
+
+    if trend == "SHORT":
+        if r[i] > 50:
+            return None
+        if dist > 0.018:
+            return None
+
+        sl = high_swing * 1.001
+        risk = max(sl - price, price * 0.002)
+        tp1 = price - risk * R_MULT_TP1
+        tp2 = price - risk * R_MULT_TP2
+
+        return {
+            "symbol": symbol,
+            "tf": TF_ENTRY,
+            "dir": "SHORT",
+            "trend_tf": TF_TREND,
+            "price": price,
+            "entry_zone": (entry_low, entry_high),
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "ts": int(ts[i]),
+            "rsi": r[i],
+            "ema20": e20[i],
+            "ema50": e50[i],
+        }
+
+    return None
+
+
+def fmt(x: float, symbol: str) -> str:
+    # простий формат під різні ціни
+    if symbol.startswith("BTC"):
+        return f"{x:,.1f}"
+    if symbol.startswith("ETH"):
+        return f"{x:,.2f}"
+    return f"{x:,.4f}"
+
+
+def format_message(sig: Dict) -> str:
     sym = sig["symbol"]
-    direction = "LONG" if sig["direction"] == "LONG" else "SHORT"
+    direction = "🟢 LONG" if sig["dir"] == "LONG" else "🔴 SHORT"
+    zl, zh = sig["entry_zone"]
+    # Чіткий тригер без “чекаємо підтвердження”
+    trigger = (
+        "Тригер: закриття 15m в зоні EMA + RSI по напрямку тренду"
+    )
+    return (
+        f"{direction} | {sym} | {sig['tf']} (фільтр {sig['trend_tf']})\n"
+        f"Зона входу: {fmt(zl, sym)} – {fmt(zh, sym)}\n"
+        f"SL: {fmt(sig['sl'], sym)}\n"
+        f"TP1: {fmt(sig['tp1'], sym)} | TP2: {fmt(sig['tp2'], sym)}\n"
+        f"{trigger}\n"
+        f"RSI: {sig['rsi']:.1f}"
+    )
 
-    ez1, ez2 = sig["entry_zone"]
-    price = sig["price"]
 
-    # One-line EN (optional). Keep it minimal.
-    en_hint = "(Plan: entry zone → SL → TP1/TP2)"
+# =========================
+# ANTI-SPAM / DAILY LIMIT
+# =========================
+def today_key() -> str:
+    return datetime.now(LOCAL_TZ).date().isoformat()
+
+
+def can_send(state: Dict, sig: Dict) -> bool:
+    key = f"{sig['symbol']}|{sig['dir']}|{sig['tf']}"
+    now = int(time.time())
+    last = int(state.get("last_sent", {}).get(key, 0))
+    if now - last < COOLDOWN_SEC:
+        return False
+
+    d = today_key()
+    daily = state.setdefault("daily", {}).setdefault(d, {"count": 0})
+    if daily["count"] >= MAX_ALERTS_PER_DAY:
+        return False
+
+    return True
+
+
+def mark_sent(state: Dict, sig: Dict) -> None:
+    key = f"{sig['symbol']}|{sig['dir']}|{sig['tf']}"
+    now = int(time.time())
+    state.setdefault("last_sent", {})[key] = now
+    d = today_key()
+    daily = state.setdefault("daily", {}).setdefault(d, {"count": 0})
+    daily["count"] = int(daily.get("count", 0)) + 1
+
+    # store for stats
+    state.setdefault("signals", []).append({
+        "id": f"{sig['symbol']}:{sig['dir']}:{sig['ts']}",
+        "symbol": sig["symbol"],
+        "dir": sig["dir"],
+        "tf": sig["tf"],
+        "ts": sig["ts"],
+        "price": sig["price"],
+        "sl": sig["sl"],
+        "tp1": sig["tp1"],
+        "tp2": sig["tp2"],
+        "status": "OPEN",     # OPEN / HIT / FAIL / MIXED
+        "resolved_ts": None
+    })
+
+
+# =========================
+# STATS EVALUATION
+# =========================
+def eval_signal_outcome(sig: Dict) -> str:
+    """
+    Простий критерій як ти хотів:
+    - якщо хоч раз TP1 торкнулися -> HIT
+    - якщо SL торкнулися раніше -> FAIL
+    - якщо в одній свічці і SL і TP1 -> MIXED
+    """
+    symbol = sig["symbol"]
+    dirn = sig["dir"]
+    since_ms = int(sig["ts"])  # kline open time ms
+    # беремо останні 200 15m свічок — достатньо для доби+ (200*15m=50h)
+    kl = get_klines(symbol, TF_ENTRY, 200)
+    if not kl:
+        return sig["status"]
+
+    # залишаємо тільки після сигналу
+    candles = [k for k in kl if int(k[0]) >= since_ms]
+    if len(candles) < 2:
+        return sig["status"]
+
+    sl = float(sig["sl"])
+    tp1 = float(sig["tp1"])
+
+    for k in candles[1:]:  # після тієї, на якій згенерували
+        high = float(k[2])
+        low = float(k[3])
+        t = int(k[0])
+
+        if dirn == "LONG":
+            hit_tp = high >= tp1
+            hit_sl = low <= sl
+        else:
+            hit_tp = low <= tp1
+            hit_sl = high >= sl
+
+        if hit_tp and hit_sl:
+            sig["resolved_ts"] = t
+            return "MIXED"
+        if hit_tp:
+            sig["resolved_ts"] = t
+            return "HIT"
+        if hit_sl:
+            sig["resolved_ts"] = t
+            return "FAIL"
+
+    return "OPEN"
+
+
+def build_daily_report(state: Dict, date_iso: str) -> Optional[str]:
+    # беремо сигнали за дату
+    try:
+        day = datetime.fromisoformat(date_iso).date()
+    except Exception:
+        return None
+
+    sigs = state.get("signals", [])
+    day_sigs = []
+    for s in sigs:
+        dt = datetime.fromtimestamp(int(s["ts"]) / 1000, tz=LOCAL_TZ).date()
+        if dt == day:
+            day_sigs.append(s)
+
+    if not day_sigs:
+        return f"📊 Підсумок дня ({date_iso}):\nСетапів: 0"
+
+    # оновлюємо статуси
+    hit = fail = mixed = open_ = 0
+    for s in day_sigs:
+        if s["status"] == "OPEN":
+            new_status = eval_signal_outcome(s)
+            s["status"] = new_status
+
+        if s["status"] == "HIT":
+            hit += 1
+        elif s["status"] == "FAIL":
+            fail += 1
+        elif s["status"] == "MIXED":
+            mixed += 1
+        else:
+            open_ += 1
+
+    total = len(day_sigs)
 
     text = (
-        f"🟡 {sym} | {sig['tf']} | {direction}\n"
-        f"Ціна: {fmt_price(price, sym)}\n\n"
-        f"План (зона входу): {fmt_price(min(ez1, ez2), sym)} – {fmt_price(max(ez1, ez2), sym)}\n"
-        f"SL: {fmt_price(sig['sl'], sym)}\n"
-        f"TP1: {fmt_price(sig['tp1'], sym)}\n"
-        f"TP2: {fmt_price(sig['tp2'], sym)}\n\n"
-        f"{sig['invalid']}\n"
-        f"{en_hint}"
+        f"📊 Підсумок дня ({date_iso})\n"
+        f"Сетапів: {total}\n"
+        f"TP1 торкнулися: {hit}\n"
+        f"SL торкнулися: {fail}\n"
+        f"Спірні (TP1+SL в одній свічці): {mixed}\n"
+        f"Ще в роботі: {open_}\n\n"
+        f"Примітка: оцінка = факт торкання рівня (без гарантії виконання)."
     )
     return text
 
-# =========================
-# Scanner loop
-# =========================
-def scanner_loop():
-    state = load_state()
 
-    # Start message (no "bot/render" words)
-    tg_send("✅ Моніторинг запущено — 15m сетапи по BTC/ETH/BNB/SOL/TON")
+def daily_report_loop(state: Dict) -> None:
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        target = now.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MIN, second=0, microsecond=0)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        sleep_for = (target - now).total_seconds()
+        time.sleep(max(5, sleep_for))
+
+        # звіт за попередній день (щоб день закрився)
+        report_date = (datetime.now(LOCAL_TZ) - timedelta(days=1)).date().isoformat()
+        if state.get("last_report_date") == report_date:
+            continue
+
+        msg = build_daily_report(state, report_date)
+        if msg:
+            tg_send(msg)
+            state["last_report_date"] = report_date
+            save_state(state)
+
+
+# =========================
+# MAIN SCANNER LOOP
+# =========================
+def scanner_loop() -> None:
+    state = load_state()
+    save_state(state)
+
+    # стартове повідомлення (без “bot/render”)
+    tg_send(f"✅ Моніторинг запущено — {TF_ENTRY}\nСетапи по BTC/ETH/BNB/SOL/TON")
+
+    # окремий потік під щоденну статистику
+    t = threading.Thread(target=daily_report_loop, args=(state,), daemon=True)
+    t.start()
 
     while True:
         try:
-            # reset daily counter
-            can_alert_today(state)
-
             for sym in SYMBOLS:
-                sig = compute_setup(sym)
-                if not sig:
-                    time.sleep(0.25)
-                    continue
-
-                direction = sig["direction"]
-                if in_cooldown(state, sym, direction):
-                    time.sleep(0.25)
-                    continue
-
-                if not can_alert_today(state):
-                    # daily cap reached
-                    break
-
-                tg_send(format_signal(sig))
-                mark_cooldown(state, sym, direction)
-                inc_alert_today(state)
-                save_state(state)
-
-                time.sleep(0.5)  # small spacing between sends
-
+                sig = make_setup(sym)
+                if sig and can_send(state, sig):
+                    tg_send(format_message(sig))
+                    mark_sent(state, sig)
+                    save_state(state)
+                time.sleep(0.25)  # мікропаузи, щоб не “лупити”
         except Exception as e:
             print("scanner error:", e)
 
         time.sleep(CHECK_EVERY_SEC)
 
+
 if __name__ == "__main__":
-    # run scanner in foreground (Background Worker is fine)
     scanner_loop()
