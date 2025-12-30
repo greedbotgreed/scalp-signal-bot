@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 
 # Binance Futures public REST
-BASE_URL = "https://fapi.binance.com"
+BASE_URL = "https://data.binance.com"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "TONUSDT"]
 
