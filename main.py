@@ -28,24 +28,35 @@ CHECK_EVERY_SEC = 60  # scan once per minute
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN = 14
+ATR_LEN = 14
 
-# Signal shaping (simple + readable)
+# Signal shaping
 MIN_EMA_GAP_PCT = 0.0015  # 0.15% between EMA20 and EMA50 to avoid noise
 RSI_LONG_MIN = 35
 RSI_SHORT_MAX = 65
 
-# Risk template (for "setup", not an order)
+# Pullback rule
+NEAR_EMA50_PCT = 0.0025  # within 0.25%
+
+# Risk (ATR-based SL) and targets by R
 SL_ATR_MULT = 1.2
-TP_RR = 1.6  # takeprofit approx RR
-ATR_LEN = 14
+TP1_R = 1.0
+TP2_R = 2.0
+TP3_R = 3.0
+
+# Pending confirmation
+PENDING_TTL_MIN = 60  # setup expires if not confirmed within 60 minutes
 
 # Anti-spam / cooldown
-COOLDOWN_MIN = 90  # per symbol+side cooldown
+COOLDOWN_MIN = 90  # per symbol+side cooldown for SETUP READY
 STATE_FILE = "state.json"
 
 # Daily stats time (local, by TZ offset)
 DAILY_STATS_HOUR = 21
 DAILY_STATS_MINUTE = 0
+
+# Outcome evaluation TF (more accurate than 15m)
+EVAL_TF = "1"  # 1m
 
 # Request hardening
 HTTP_TIMEOUT = 12
@@ -77,12 +88,21 @@ def tg_send(text: str) -> None:
 def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            s = json.load(f)
+            # migrate if older
+            s.setdefault("last_sent", {})
+            s.setdefault("pending", {})   # setup ready waiting confirm
+            s.setdefault("trades", [])    # confirmed trades for stats
+            s.setdefault("setups", [])    # for counting set-ups/day
+            s.setdefault("daily", {"last_stats_date": ""})
+            return s
     except Exception:
         return {
-            "last_sent": {},     # key -> unix ts
-            "signals": [],       # list of signals (for stats)
-            "daily": {"last_stats_date": ""}  # YYYY-MM-DD
+            "last_sent": {},
+            "pending": {},
+            "trades": [],
+            "setups": [],
+            "daily": {"last_stats_date": ""}
         }
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -186,8 +206,45 @@ def atr(candles: List[Dict[str, float]], length: int) -> Optional[float]:
     trs = []
     for i in range(1, len(candles)):
         trs.append(true_range(candles[i - 1]["c"], candles[i]["h"], candles[i]["l"]))
-    # simple ATR is fine for MVP
     return sum(trs[-length:]) / length
+
+def round_nice(x: float) -> float:
+    if x == 0:
+        return 0.0
+    p = max(0, 6 - int(math.floor(math.log10(abs(x)))) - 1)
+    return round(x, min(max(p, 2), 6))
+
+# =========================
+# CONFIRM HELPERS
+# =========================
+def last_closed_candle(symbol: str, interval: str) -> Optional[Dict[str, float]]:
+    candles = bybit_klines(symbol, interval, limit=3)
+    if len(candles) < 3:
+        return None
+    return candles[-2]  # previous candle is closed
+
+def ema_at_closed(symbol: str, interval: str, length: int) -> Optional[float]:
+    candles = bybit_klines(symbol, interval, limit=250)
+    if len(candles) < 120:
+        return None
+    closes = [c["c"] for c in candles]
+    e = ema(closes, length)
+    if not e or len(e) < 3:
+        return None
+    return float(e[-2])  # EMA value at closed candle
+
+def is_confirmed(sig: Dict[str, Any]) -> bool:
+    c = last_closed_candle(sig["symbol"], sig["tf"])
+    if not c:
+        return False
+    ef = ema_at_closed(sig["symbol"], sig["tf"], EMA_FAST)
+    if ef is None:
+        return False
+    close = float(c["c"])
+    if sig["side"] == "LONG":
+        return close > ef
+    else:
+        return close < ef
 
 # =========================
 # SETUP LOGIC
@@ -206,19 +263,13 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
     if not ema_fast or not ema_slow or not r or a is None:
         return None
 
-    # align indices: ema outputs full length (starting from first), rsi padded;
-    # use last values safely
-    price = closes[-1]
-    ef = ema_fast[-1]
-    es = ema_slow[-1]
-    rv = r[-1]
+    price = float(closes[-1])
+    ef = float(ema_fast[-1])
+    es = float(ema_slow[-1])
+    rv = float(r[-1])
 
     gap_pct = abs(ef - es) / price
-
-    # Trend filter + "pullback to EMA50"
-    # LONG: EMA20 > EMA50, price near EMA50, RSI recovering
-    # SHORT: EMA20 < EMA50, price near EMA50, RSI cooling
-    near_ema50 = abs(price - es) / price <= 0.0025  # within 0.25%
+    near_ema50 = abs(price - es) / price <= NEAR_EMA50_PCT
 
     if gap_pct < MIN_EMA_GAP_PCT or not near_ema50:
         return None
@@ -226,74 +277,150 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
     side = None
     reason = ""
 
-    if ef > es and rv >= RSI_LONG_MIN and rv <= 60:
+    # LONG
+    if ef > es and (RSI_LONG_MIN <= rv <= 60):
         side = "LONG"
         reason = f"тренд вгору (EMA{EMA_FAST}>{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
-    elif ef < es and rv <= RSI_SHORT_MAX and rv >= 40:
+    # SHORT
+    elif ef < es and (40 <= rv <= RSI_SHORT_MAX):
         side = "SHORT"
         reason = f"тренд вниз (EMA{EMA_FAST}<{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
     else:
         return None
 
-    # Risk levels from ATR
-    # Use entry = current price (setup-level), SL/TP from ATR
+    # Setup-level entry is current price (orientation).
     entry = price
     sl_dist = a * SL_ATR_MULT
+
     if side == "LONG":
         sl = entry - sl_dist
-        tp = entry + sl_dist * TP_RR
     else:
         sl = entry + sl_dist
-        tp = entry - sl_dist * TP_RR
-
-    # Round nicely
-    def r6(x: float) -> float:
-        if x == 0:
-            return 0.0
-        # dynamic rounding
-        p = max(0, 6 - int(math.floor(math.log10(abs(x)))) - 1)
-        return round(x, min(max(p, 2), 6))
 
     return {
         "symbol": symbol,
         "tf": TF,
         "side": side,
-        "entry": r6(entry),
-        "sl": r6(sl),
-        "tp": r6(tp),
-        "ema_fast": r6(ef),
-        "ema_slow": r6(es),
+        "entry": round_nice(entry),
+        "sl": round_nice(sl),
+        "ema_fast": round_nice(ef),
+        "ema_slow": round_nice(es),
         "rsi": round(rv, 1),
         "reason": reason,
         "ts": int(time.time()),
-        "t_ms": candles[-1]["t"],
+        "t_ms": int(candles[-1]["t"]),
     }
 
-def format_setup(sig: Dict[str, Any]) -> str:
-    # IMPORTANT: no "bot", no "render", no exchange naming.
+def build_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return entry, entry, entry
+    if side == "LONG":
+        return (
+            entry + risk * TP1_R,
+            entry + risk * TP2_R,
+            entry + risk * TP3_R
+        )
+    else:
+        return (
+            entry - risk * TP1_R,
+            entry - risk * TP2_R,
+            entry - risk * TP3_R
+        )
+
+# =========================
+# MESSAGE FORMAT
+# =========================
+def format_setup_ready(sig: Dict[str, Any]) -> str:
     sym = sig["symbol"]
     side = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
     tf = sig["tf"]
-
-    # Make it clear: it's a setup, and what is "confirmation"
-    # Use a single confirmation rule:
-    # LONG: close above EMA20 on 15m
-    # SHORT: close below EMA20 on 15m
-    confirm = "закріплення 15m вище EMA20" if sig["side"] == "LONG" else "закріплення 15m нижче EMA20"
-
-    text = (
-        f"⚡️ Сетап {sym} | {tf}m\n"
+    trigger = "15m close вище EMA20" if sig["side"] == "LONG" else "15m close нижче EMA20"
+    return (
+        f"👀 SETUP READY | {sym} | {tf}m\n"
         f"{side}\n\n"
-        f"Entry: {sig['entry']}\n"
-        f"SL: {sig['sl']}\n"
-        f"TP: {sig['tp']}\n\n"
-        f"Умова підтвердження: {confirm}\n"
+        f"Орієнтир: {sig['entry']}\n"
+        f"SL (орієнтир): {sig['sl']}\n\n"
+        f"Тригер: {trigger}\n"
         f"Контекст: {sig['reason']}\n"
     )
-    return text
+
+def format_entry_confirmed(tr: Dict[str, Any]) -> str:
+    sym = tr["symbol"]
+    side = "🟢 LONG" if tr["side"] == "LONG" else "🔴 SHORT"
+    tf = tr["tf"]
+    return (
+        f"✅ ENTRY CONFIRMED | {sym} | {tf}m\n"
+        f"{side}\n\n"
+        f"Entry: {tr['entry']}\n"
+        f"SL: {tr['sl']}\n"
+        f"TP1: {tr['tp1']}\n"
+        f"TP2: {tr['tp2']}\n"
+        f"TP3: {tr['tp3']}\n\n"
+        f"Ризик: 1–2% (фікс)\n"
+        f"Контекст: {tr.get('reason','')}\n"
+    )
 
 # =========================
-# STATS EVALUATION
+# OUTCOME EVAL (1m)
+# =========================
+def eval_trade_hit(tr: Dict[str, Any]) -> str:
+    symbol = tr["symbol"]
+    side = tr["side"]
+    start_ms = int(tr.get("confirm_t_ms", 0))
+
+    sl = float(tr["sl"])
+    tp1 = float(tr["tp1"])
+    tp2 = float(tr["tp2"])
+    tp3 = float(tr["tp3"])
+
+    candles = bybit_klines(symbol, EVAL_TF, limit=500)
+    if not candles:
+        return "OPEN"
+
+    relevant = [c for c in candles if c["t"] >= start_ms]
+    if not relevant:
+        relevant = candles[-200:]
+
+    for c in relevant:
+        hi, lo = c["h"], c["l"]
+
+        # conservative: if both SL and any TP touched in same candle -> SL
+        if side == "LONG":
+            sl_hit = lo <= sl
+            tp1_hit = hi >= tp1
+            tp2_hit = hi >= tp2
+            tp3_hit = hi >= tp3
+            if sl_hit and (tp1_hit or tp2_hit or tp3_hit):
+                return "SL"
+            if sl_hit:
+                return "SL"
+            if tp3_hit:
+                return "TP3"
+            if tp2_hit:
+                return "TP2"
+            if tp1_hit:
+                return "TP1"
+        else:
+            sl_hit = hi >= sl
+            tp1_hit = lo <= tp1
+            tp2_hit = lo <= tp2
+            tp3_hit = lo <= tp3
+            if sl_hit and (tp1_hit or tp2_hit or tp3_hit):
+                return "SL"
+            if sl_hit:
+                return "SL"
+            if tp3_hit:
+                return "TP3"
+            if tp2_hit:
+                return "TP2"
+            if tp1_hit:
+                return "TP1"
+
+    return "OPEN"
+
+# =========================
+# TIME HELPERS
 # =========================
 def local_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
@@ -301,106 +428,121 @@ def local_now() -> datetime:
 def yyyy_mm_dd(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
-def eval_signal_hit(sig: Dict[str, Any]) -> str:
-    """
-    Evaluate signal outcome since its timestamp:
-    WIN if TP touched at least once.
-    LOSS if SL touched at least once before TP (best-effort with candles).
-    OPEN if neither touched.
-    """
-    symbol = sig["symbol"]
-    side = sig["side"]
-    entry_ts = int(sig.get("t_ms", 0))  # candle start ms
-    tp = float(sig["tp"])
-    sl = float(sig["sl"])
-
-    # fetch recent klines; Bybit doesn't accept startTime in this endpoint easily for all cases,
-    # so we pull a chunk and filter by time.
-    candles = bybit_klines(symbol, TF, limit=200)
-    if not candles:
-        return "OPEN"
-
-    relevant = [c for c in candles if c["t"] >= entry_ts]
-    if not relevant:
-        relevant = candles[-80:]
-
-    for c in relevant:
-        hi = c["h"]
-        lo = c["l"]
-        # In same candle, if both touched, treat as LOSS (conservative)
-        if side == "LONG":
-            tp_hit = hi >= tp
-            sl_hit = lo <= sl
-            if tp_hit and sl_hit:
-                return "LOSS"
-            if sl_hit:
-                return "LOSS"
-            if tp_hit:
-                return "WIN"
-        else:
-            tp_hit = lo <= tp
-            sl_hit = hi >= sl
-            if tp_hit and sl_hit:
-                return "LOSS"
-            if sl_hit:
-                return "LOSS"
-            if tp_hit:
-                return "WIN"
-
-    return "OPEN"
-
+# =========================
+# DAILY STATS
+# =========================
 def send_daily_stats(state: Dict[str, Any]) -> None:
     today = yyyy_mm_dd(local_now())
     last = state.get("daily", {}).get("last_stats_date", "")
     if last == today:
         return
 
-    # only send after 21:00 local
     now = local_now()
     if (now.hour, now.minute) < (DAILY_STATS_HOUR, DAILY_STATS_MINUTE):
         return
 
-    # signals within "today" local window
+    # Local day window
     start_local = datetime(now.year, now.month, now.day, 0, 0, tzinfo=timezone.utc) - timedelta(hours=TZ_OFFSET_HOURS)
     end_local = start_local + timedelta(days=1)
     start_ts = int(start_local.timestamp())
     end_ts = int(end_local.timestamp())
 
-    sigs = state.get("signals", [])
-    todays = [s for s in sigs if start_ts <= int(s.get("ts", 0)) < end_ts]
+    setups_today = [s for s in state.get("setups", []) if start_ts <= int(s.get("ts", 0)) < end_ts]
+    trades_today = [t for t in state.get("trades", []) if start_ts <= int(t.get("ts", 0)) < end_ts]
 
-    wins = 0
-    losses = 0
-    open_ = 0
-    for s in todays:
-        res = eval_signal_hit(s)
-        s["result"] = res
-        if res == "WIN":
-            wins += 1
-        elif res == "LOSS":
-            losses += 1
+    setups_found = len(setups_today)
+    activated = len(trades_today)
+
+    sl = tp1 = tp2 = tp3 = open_ = 0
+    for t in trades_today:
+        res = eval_trade_hit(t)
+        t["result"] = res
+        if res == "SL":
+            sl += 1
+        elif res == "TP1":
+            tp1 += 1
+        elif res == "TP2":
+            tp2 += 1
+        elif res == "TP3":
+            tp3 += 1
         else:
             open_ += 1
 
-    total = len(todays)
-    if total == 0:
+    if setups_found == 0:
         text = (
-            "📊 Підсумок дня (21:00)\n"
-            "Сьогодні сетапів не було.\n"
+            "📊 Daily Report (21:00)\n"
+            "Сетапів не було.\n"
             "Завтра продовжимо моніторинг."
         )
     else:
         text = (
-            "📊 Підсумок дня (21:00)\n"
-            f"Сетапів: {total}\n"
-            f"✅ TP торкалось: {wins}\n"
-            f"❌ SL торкалось: {losses}\n"
+            "📊 Daily Report (21:00)\n"
+            f"Сетапів знайдено: {setups_found}\n"
+            f"✅ Activated (confirmed): {activated}\n\n"
+            f"❌ SL: {sl}\n"
+            f"✅ TP1: {tp1}\n"
+            f"✅ TP2: {tp2}\n"
+            f"✅ TP3: {tp3}\n"
             f"⏳ В роботі: {open_}\n\n"
-            "Критерій: якщо ціна хоч раз торкнулась TP/SL — зараховано."
+            "У статистику входять тільки ENTRY CONFIRMED."
         )
 
     tg_send(text)
     state.setdefault("daily", {})["last_stats_date"] = today
+    save_state(state)
+
+# =========================
+# PENDING → CONFIRMED
+# =========================
+def process_pending(state: Dict[str, Any]) -> None:
+    now_ts = int(time.time())
+    pending = state.get("pending", {})
+    if not pending:
+        return
+
+    to_delete = []
+    for pid, sig in list(pending.items()):
+        if now_ts > int(sig.get("expires_ts", 0)):
+            to_delete.append(pid)
+            continue
+
+        if not is_confirmed(sig):
+            continue
+
+        # confirmed entry = close of last closed 15m candle
+        c = last_closed_candle(sig["symbol"], sig["tf"])
+        if not c:
+            continue
+
+        entry = float(c["c"])
+        sl = float(sig["sl"])
+
+        tp1, tp2, tp3 = build_targets(entry, sl, sig["side"])
+
+        tr = {
+            "id": pid,
+            "symbol": sig["symbol"],
+            "tf": sig["tf"],
+            "side": sig["side"],
+            "entry": round_nice(entry),
+            "sl": round_nice(sl),
+            "tp1": round_nice(tp1),
+            "tp2": round_nice(tp2),
+            "tp3": round_nice(tp3),
+            "reason": sig.get("reason", ""),
+            "ts": now_ts,              # confirm time
+            "confirm_t_ms": int(c["t"]) # start ms of closed candle
+        }
+
+        state.setdefault("trades", []).append(tr)
+        tg_send(format_entry_confirmed(tr))
+
+        to_delete.append(pid)
+
+    for pid in to_delete:
+        pending.pop(pid, None)
+
+    save_state(state)
 
 # =========================
 # MAIN LOOP
@@ -408,7 +550,6 @@ def send_daily_stats(state: Dict[str, Any]) -> None:
 def announce_start() -> None:
     coins = "/".join([s.replace("USDT", "") for s in SYMBOLS])
     tf = f"{TF}m"
-    # No "bot", no platform naming
     tg_send(f"✅ Моніторинг активовано — {tf} сетапи по {coins}")
 
 def scanner_loop() -> None:
@@ -418,13 +559,19 @@ def scanner_loop() -> None:
     while True:
         now_ts = int(time.time())
 
-        # daily stats
+        # 1) process confirmations
+        try:
+            process_pending(state)
+        except Exception as e:
+            print("process_pending error:", e)
+
+        # 2) daily stats
         try:
             send_daily_stats(state)
         except Exception as e:
             print("daily stats error:", e)
 
-        # scan symbols
+        # 3) scan for new setups
         for sym in SYMBOLS:
             try:
                 sig = compute_setup(sym)
@@ -435,15 +582,26 @@ def scanner_loop() -> None:
                 if not cooldown_ok(state, key, now_ts):
                     continue
 
-                # send setup
-                tg_send(format_setup(sig))
+                # Unique id based on candle time
+                setup_id = f"{sig['symbol']}:{sig['side']}:{sig['t_ms']}"
+                sig["id"] = setup_id
+                sig["expires_ts"] = now_ts + (PENDING_TTL_MIN * 60)
 
-                # store for stats
-                state.setdefault("signals", []).append(sig)
+                # Send SETUP READY
+                tg_send(format_setup_ready(sig))
+
+                # Store setup for daily counting
+                state.setdefault("setups", []).append({"id": setup_id, "ts": now_ts})
+
+                # Put into pending for confirmation
+                state.setdefault("pending", {})[setup_id] = sig
+
+                # Mark cooldown
                 mark_sent(state, key, now_ts)
                 save_state(state)
 
                 time.sleep(0.25)
+
             except Exception as e:
                 print("scan error:", sym, e)
 
