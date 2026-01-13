@@ -18,7 +18,9 @@ BYBIT_BASE = "https://api.bybit.com"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "TONUSDT"]
 
-TF = "15"
+# Base TF for setups
+TF = "15"              # 15m
+HTF = "60"             # 1h (higher timeframe filter)
 CHECK_EVERY_SEC = 60
 
 EMA_FAST = 20
@@ -26,15 +28,32 @@ EMA_SLOW = 50
 RSI_LEN = 14
 ATR_LEN = 14
 
-MIN_EMA_GAP_PCT = 0.0015
+# --- Filters / scoring thresholds ---
+MIN_EMA_GAP_PCT = 0.0015        # 0.15% gap between EMA20/50 (avoid flat)
+NEAR_EMA50_PCT = 0.0025         # price near EMA50 (pullback)
+MIN_ATR_PCT = 0.006             # ATR/price >= 0.6% (avoid dead market)
+EMA_SLOPE_LOOKBACK = 10         # bars for slope check
+EMA_SLOPE_MIN = 0.0006          # min slope magnitude (0.06% of price)
+MAX_FAST_EMA_CROSSES = 3        # too many crosses -> chop
+IMPULSE_ATR_MULT = 1.5          # last candle range > 1.5*ATR -> impulse (risk)
+
+# RSI gates (basic)
 RSI_LONG_MIN = 35
 RSI_SHORT_MAX = 65
-NEAR_EMA50_PCT = 0.0025
 
+# Stops/targets (risk-based)
 SL_ATR_MULT = 1.2
 TP1_R = 1.0
 TP2_R = 2.0
 TP3_R = 3.0
+
+# R gating for traffic light
+MIN_R_YELLOW = 1.8
+MIN_R_GREEN = 2.5
+
+# Score gating
+MIN_SCORE_YELLOW = 5
+MIN_SCORE_GREEN = 7
 
 # ==== SMART ENTRY (OFFSET BY ATR) ====
 OFFSET_MULT = {
@@ -58,6 +77,9 @@ DAILY_STATS_MINUTE = 0
 EVAL_TF = "1"
 HTTP_TIMEOUT = 12
 RETRY_SLEEP = 2.0
+
+# Post only GREEN/YELLOW (requested)
+POST_ONLY_GREEN_YELLOW = True
 
 # =========================
 # TELEGRAM
@@ -89,7 +111,7 @@ def load_state() -> Dict[str, Any]:
             s.setdefault("last_sent", {})
             s.setdefault("pending", {})     # setup waiting confirm
             s.setdefault("trades", [])      # confirmed signals (some will become FILLED)
-            s.setdefault("setups", [])      # count setups/day
+            s.setdefault("setups", [])      # count setups/day (actionable only)
             s.setdefault("daily", {"last_stats_date": ""})
             return s
     except Exception:
@@ -240,8 +262,117 @@ def is_confirmed(sig: Dict[str, Any]) -> bool:
     else:
         return close < ef
 
+def count_crosses(closes: List[float], ema_line: List[float], lookback: int = 30) -> int:
+    if len(closes) < lookback + 2 or len(ema_line) < lookback + 2:
+        return 0
+    n = min(lookback + 1, len(closes) - 1, len(ema_line) - 1)
+    crosses = 0
+    # Compare sign of (close-ema)
+    prev = closes[-(n+1)] - ema_line[-(n+1)]
+    for i in range(n, 0, -1):
+        cur = closes[-i] - ema_line[-i]
+        if (prev <= 0 < cur) or (prev >= 0 > cur):
+            crosses += 1
+        prev = cur
+    return crosses
+
+def structure_ok_15m(candles: List[Dict[str, float]], side: str) -> bool:
+    """
+    Very lightweight structure check using last 3 CLOSED candles:
+      LONG: higher high & higher low
+      SHORT: lower high & lower low
+    """
+    if len(candles) < 5:
+        return False
+    c1 = candles[-2]  # last closed
+    c2 = candles[-3]  # prev closed
+    if side == "LONG":
+        return (c1["h"] > c2["h"]) and (c1["l"] > c2["l"])
+    else:
+        return (c1["h"] < c2["h"]) and (c1["l"] < c2["l"])
+
+def htf_trend(symbol: str) -> Optional[str]:
+    """
+    Returns "LONG", "SHORT" or None based on 1h EMA20/50 direction.
+    """
+    candles = bybit_klines(symbol, HTF, limit=250)
+    if len(candles) < 120:
+        return None
+    closes = [c["c"] for c in candles]
+    ef = ema(closes, EMA_FAST)
+    es = ema(closes, EMA_SLOW)
+    if not ef or not es:
+        return None
+    if ef[-1] > es[-1]:
+        return "LONG"
+    if ef[-1] < es[-1]:
+        return "SHORT"
+    return None
+
+def compute_target_price(candles: List[Dict[str, float]], side: str, lookback: int = 96) -> Optional[float]:
+    """
+    Simple logical target:
+      LONG -> recent range high (liquidity above)
+      SHORT -> recent range low (liquidity below)
+    lookback 96 on 15m ~ 24h
+    """
+    if len(candles) < lookback + 5:
+        return None
+    recent = candles[-lookback:]
+    hi = max(c["h"] for c in recent)
+    lo = min(c["l"] for c in recent)
+    return hi if side == "LONG" else lo
+
+def r_potential(entry: float, sl: float, target: float) -> float:
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return 0.0
+    reward = abs(target - entry)
+    return reward / risk
+
+def market_is_choppy(price: float, candles: List[Dict[str, float]], ef_line: List[float], es_line: List[float], a: float) -> Tuple[bool, str]:
+    """
+    Detect chop/flat regimes (avoid "many SL, one TP" periods).
+    Returns (is_chop, reason)
+    """
+    # 1) low volatility
+    if a / price < MIN_ATR_PCT:
+        return True, "низька волатильність (флет)"
+
+    # 2) EMA spread too small
+    ef = ef_line[-1]
+    es = es_line[-1]
+    ema_spread = abs(ef - es) / price
+    if ema_spread < MIN_EMA_GAP_PCT:
+        return True, "EMA злиплись (пилка/флет)"
+
+    # 3) too many crosses of price vs EMA20 recently
+    closes = [c["c"] for c in candles]
+    crosses = count_crosses(closes, ef_line, lookback=30)
+    if crosses >= MAX_FAST_EMA_CROSSES:
+        return True, "часті перетини EMA20 (пилка)"
+
+    # 4) EMA slope too flat
+    if len(ef_line) > EMA_SLOPE_LOOKBACK + 2:
+        slope = (ef_line[-1] - ef_line[-(EMA_SLOPE_LOOKBACK+1)]) / price
+        if abs(slope) < EMA_SLOPE_MIN:
+            return True, "EMA20 майже без нахилу (флет)"
+
+    return False, ""
+
+def last_candle_impulse(candles: List[Dict[str, float]], a: float) -> bool:
+    """
+    If last candle (current/unfinished) is too large relative to ATR -> impulse.
+    We use latest candle range as a proxy; safer to use last closed, but here ok.
+    """
+    if not candles or a is None:
+        return False
+    c = candles[-1]
+    rng = float(c["h"] - c["l"])
+    return rng > (IMPULSE_ATR_MULT * a)
+
 # =========================
-# SETUP LOGIC
+# SETUP LOGIC (NOW WITH TRAFFIC LIGHT)
 # =========================
 def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
     candles = bybit_klines(symbol, TF, limit=250)
@@ -249,40 +380,127 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     closes = [c["c"] for c in candles]
-    ema_fast = ema(closes, EMA_FAST)
-    ema_slow = ema(closes, EMA_SLOW)
-    r = rsi(closes, RSI_LEN)
+    ef_line = ema(closes, EMA_FAST)
+    es_line = ema(closes, EMA_SLOW)
+    r_line = rsi(closes, RSI_LEN)
     a = atr(candles, ATR_LEN)
 
-    if not ema_fast or not ema_slow or not r or a is None:
+    if not ef_line or not es_line or not r_line or a is None:
         return None
 
     price = float(closes[-1])
-    ef = float(ema_fast[-1])
-    es = float(ema_slow[-1])
-    rv = float(r[-1])
+    ef = float(ef_line[-1])
+    es = float(es_line[-1])
+    rv = float(r_line[-1])
 
-    gap_pct = abs(ef - es) / price
+    # Must be near EMA50 (pullback idea)
     near_ema50 = abs(price - es) / price <= NEAR_EMA50_PCT
-
-    if gap_pct < MIN_EMA_GAP_PCT or not near_ema50:
+    if not near_ema50:
         return None
 
+    # Side candidate
     side = None
-    reason = ""
-
     if ef > es and (RSI_LONG_MIN <= rv <= 60):
         side = "LONG"
-        reason = f"тренд вгору (EMA{EMA_FAST}>{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
     elif ef < es and (40 <= rv <= RSI_SHORT_MAX):
         side = "SHORT"
-        reason = f"тренд вниз (EMA{EMA_FAST}<{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
     else:
         return None
 
+    # No-trade / chop gate
+    chop, chop_reason = market_is_choppy(price, candles, ef_line, es_line, a)
+
+    # HTF trend filter (+scoring)
+    htf_side = htf_trend(symbol)
+
+    # Structure check
+    struct_ok = structure_ok_15m(candles, side)
+
+    # Impulse filter
+    impulse = last_candle_impulse(candles, a)
+
+    # Compute SL and target (for R_potential estimation at setup time)
     entry = price
     sl_dist = a * SL_ATR_MULT
     sl = entry - sl_dist if side == "LONG" else entry + sl_dist
+    target = compute_target_price(candles, side, lookback=96)
+
+    rp = 0.0
+    if target is not None:
+        # Only meaningful if target is in the expected direction
+        if (side == "LONG" and target > entry) or (side == "SHORT" and target < entry):
+            rp = r_potential(entry, sl, target)
+
+    # Score
+    score = 0
+    reasons = []
+
+    # HTF alignment
+    if htf_side == side:
+        score += 2
+        reasons.append("HTF в ту ж сторону")
+    else:
+        reasons.append("HTF не підтверджує")
+
+    # Structure
+    if struct_ok:
+        score += 2
+        reasons.append("структура ок")
+    else:
+        reasons.append("структура слабка")
+
+    # EMA zone idea (near EMA50 already true) -> add point
+    score += 1
+    reasons.append("відкат до EMA50")
+
+    # RSI sanity (not extreme)
+    if (side == "LONG" and rv <= 60) or (side == "SHORT" and rv >= 40):
+        score += 1
+        reasons.append("RSI в нормі")
+
+    # No impulse bonus, impulse penalty (soft)
+    if not impulse:
+        score += 1
+        reasons.append("без імпульсу")
+    else:
+        reasons.append("є імпульс (ризик)")
+
+    # R potential points
+    if rp >= 3.0:
+        score += 2
+        reasons.append(f"R потенціал {rp:.1f} (3+)")
+    elif rp >= 2.0:
+        score += 1
+        reasons.append(f"R потенціал {rp:.1f}")
+
+    # Decide color
+    color = "RED"
+    market_mode = "пилка/флет" if chop else "тренд/рух"
+
+    if not chop:
+        if score >= MIN_SCORE_GREEN and rp >= MIN_R_GREEN:
+            color = "GREEN"
+        elif score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW:
+            color = "YELLOW"
+        else:
+            color = "RED"
+
+    # If we only post GREEN/YELLOW, skip RED here
+    if POST_ONLY_GREEN_YELLOW and color == "RED":
+        return None
+
+    # Human-readable context
+    if side == "LONG":
+        reason = f"тренд вгору (EMA{EMA_FAST}>{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
+    else:
+        reason = f"тренд вниз (EMA{EMA_FAST}<{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
+
+    # Add extra notes for traffic light
+    notes = []
+    if chop:
+        notes.append(f"🔴 Режим: {chop_reason}")
+    if impulse:
+        notes.append("⚠️ Імпульсна свічка: можливий хід проти")
 
     return {
         "symbol": symbol,
@@ -294,6 +512,18 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
         "reason": reason,
         "ts": int(time.time()),
         "t_ms": int(candles[-1]["t"]),
+
+        # traffic-light metadata
+        "color": color,
+        "score": int(score),
+        "r_potential": round(float(rp), 2),
+        "market_mode": market_mode,
+        "htf_side": htf_side or "",
+        "structure_ok": bool(struct_ok),
+        "impulse": bool(impulse),
+        "target_price": round_nice(float(target)) if target is not None else None,
+        "notes": notes,
+        "score_reasons": reasons,
     }
 
 def build_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
@@ -307,24 +537,30 @@ def build_targets(entry: float, sl: float, side: str) -> Tuple[float, float, flo
 # =========================
 # MESSAGE FORMAT
 # =========================
-def format_setup_ready(sig: Dict[str, Any]) -> str:
-    sym = sig["symbol"]
-    side = "🟢 LONG" if sig["side"] == "LONG" else "🔴 SHORT"
-    tf = sig["tf"]
-    trigger = "15m close вище EMA20" if sig["side"] == "LONG" else "15m close нижче EMA20"
-    return (
-        f"👀 SETUP READY | {sym} | {tf}m\n"
-        f"{side}\n\n"
-        f"Орієнтир: {sig['entry']}\n"
-        f"SL (орієнтир): {sig['sl']}\n\n"
-        f"Тригер: {trigger}\n"
-        f"Контекст: {sig['reason']}\n"
-    )
+def traffic_block(color: str, score: int, rp: float, market_mode: str, impulse: bool) -> str:
+    if color == "GREEN":
+        badge = "🟢 Індикатор: зелений — можна працювати"
+    else:
+        badge = "🟡 Індикатор: жовтий — обережно"
+    warn = " | ⚠️ імпульс" if impulse else ""
+    return f"{badge}\nScore: {score}/10 | R потенціал: {rp:.2f} | Режим: {market_mode}{warn}"
 
 def format_entry_confirmed_zone(tr: Dict[str, Any]) -> str:
     sym = tr["symbol"]
     side = "🟢 LONG" if tr["side"] == "LONG" else "🔴 SHORT"
     tf = tr["tf"]
+
+    # Traffic light
+    color = tr.get("color", "YELLOW")
+    score = int(tr.get("score", 0))
+    rp = float(tr.get("r_potential", 0.0))
+    market_mode = tr.get("market_mode", "")
+    impulse = bool(tr.get("impulse", False))
+
+    extra_notes = tr.get("notes", [])
+    extra = ""
+    if extra_notes:
+        extra = "\n" + "\n".join(extra_notes)
 
     return (
         f"✅ ENTRY CONFIRMED | {sym} | {tf}m\n"
@@ -336,7 +572,9 @@ def format_entry_confirmed_zone(tr: Dict[str, Any]) -> str:
         f"TP2: {tr['tp2']}\n"
         f"TP3: {tr['tp3']}\n\n"
         f"Ризик: 1–2% (фікс)\n"
-        f"Контекст: {tr.get('reason','')}\n"
+        f"Контекст: {tr.get('reason','')}\n\n"
+        f"{traffic_block(color, score, rp, market_mode, impulse)}"
+        f"{extra}\n"
     )
 
 # =========================
@@ -441,18 +679,15 @@ def process_trade_fills(state: Dict[str, Any]) -> None:
         if status in ("FILLED", "NO_FILL", "CLOSED"):
             continue
 
-        # time window for fill
         confirm_ts = int(tr.get("ts", 0))
         if confirm_ts <= 0:
             continue
 
-        # if too late -> NO_FILL
         if now_ts > (confirm_ts + FILL_TTL_MIN * 60):
             tr["status"] = "NO_FILL"
             changed = True
             continue
 
-        # check if limit touched
         fill_t_ms = is_limit_touched(tr)
         if fill_t_ms is not None:
             tr["status"] = "FILLED"
@@ -489,6 +724,7 @@ def send_daily_stats(state: Dict[str, Any]) -> None:
     start_ts = int(start_local.timestamp())
     end_ts = int(end_local.timestamp())
 
+    # NOTE: setups list contains ONLY actionable (green/yellow) setups now
     setups_today = [s for s in state.get("setups", []) if start_ts <= int(s.get("ts", 0)) < end_ts]
     trades_today = [t for t in state.get("trades", []) if start_ts <= int(t.get("ts", 0)) < end_ts]
 
@@ -519,13 +755,13 @@ def send_daily_stats(state: Dict[str, Any]) -> None:
     if setups_found == 0:
         text = (
             "📊 Daily Report (21:00)\n"
-            "Сетапів не було.\n"
+            "Сетапів (🟢/🟡) не було.\n"
             "Завтра продовжимо моніторинг."
         )
     else:
         text = (
             "📊 Daily Report (21:00)\n"
-            f"Сетапів знайдено: {setups_found}\n"
+            f"Сетапів (🟢/🟡) знайдено: {setups_found}\n"
             f"✅ Confirmed: {confirmed}\n"
             f"🎯 Filled (limit touched): {filled}\n"
             f"⏭ No fill (skip): {no_fill}\n\n"
@@ -572,7 +808,6 @@ def process_pending(state: Dict[str, Any]) -> None:
         k = float(OFFSET_MULT.get(sig["symbol"], 0.35))
         offset = a * k
 
-        # Zone high = confirmed close, zone low/high depends on side
         if sig["side"] == "LONG":
             zone_high = entry_confirm
             zone_low = entry_confirm - offset
@@ -585,6 +820,31 @@ def process_pending(state: Dict[str, Any]) -> None:
         sl = float(sig["sl"])
         tp1, tp2, tp3 = build_targets(entry_limit, sl, sig["side"])
 
+        # Recompute R potential using stored target_price (more accurate with entry_limit)
+        target_price = sig.get("target_price")
+        rp = float(sig.get("r_potential", 0.0))
+        if target_price is not None:
+            tp = float(target_price)
+            if (sig["side"] == "LONG" and tp > entry_limit) or (sig["side"] == "SHORT" and tp < entry_limit):
+                rp = r_potential(entry_limit, sl, tp)
+
+        # Keep the same color logic, but ensure green/yellow rules still hold
+        score = int(sig.get("score", 0))
+        market_mode = sig.get("market_mode", "")
+        impulse = bool(sig.get("impulse", False))
+        color = sig.get("color", "YELLOW")
+
+        # If after recompute it falls below thresholds, downgrade
+        if color == "GREEN" and not (score >= MIN_SCORE_GREEN and rp >= MIN_R_GREEN):
+            color = "YELLOW" if (score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW) else "RED"
+        if color == "YELLOW" and not (score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW):
+            color = "RED"
+
+        # Still: post only 🟢🟡
+        if POST_ONLY_GREEN_YELLOW and color == "RED":
+            to_delete.append(pid)
+            continue
+
         tr = {
             "id": pid,
             "symbol": sig["symbol"],
@@ -592,7 +852,6 @@ def process_pending(state: Dict[str, Any]) -> None:
             "side": sig["side"],
             "status": "CONFIRMED",
 
-            # zone + recommended limit
             "entry_zone_low": round_nice(zone_low),
             "entry_zone_high": round_nice(zone_high),
             "entry_limit": round_nice(entry_limit),
@@ -603,8 +862,16 @@ def process_pending(state: Dict[str, Any]) -> None:
             "tp3": round_nice(tp3),
 
             "reason": sig.get("reason", ""),
-            "ts": now_ts,                # confirm time (seconds)
-            "confirm_t_ms": int(c["t"]),  # confirm candle start (ms)
+            "ts": now_ts,
+            "confirm_t_ms": int(c["t"]),
+
+            # traffic-light metadata copied/updated
+            "color": color,
+            "score": score,
+            "r_potential": round(float(rp), 2),
+            "market_mode": market_mode,
+            "impulse": impulse,
+            "notes": sig.get("notes", []),
         }
 
         state.setdefault("trades", []).append(tr)
@@ -623,7 +890,7 @@ def process_pending(state: Dict[str, Any]) -> None:
 def announce_start() -> None:
     coins = "/".join([s.replace("USDT", "") for s in SYMBOLS])
     tf = f"{TF}m"
-    tg_send(f"✅ Моніторинг активовано — {tf} сетапи по {coins}")
+    tg_send(f"✅ Моніторинг активовано — {tf} сетапи (постимо тільки 🟢🟡) по {coins}")
 
 def scanner_loop() -> None:
     state = load_state()
@@ -657,7 +924,8 @@ def scanner_loop() -> None:
                 if not sig:
                     continue
 
-                key = f"{sym}:{sig['side']}:{TF}"
+                # cooldown key includes color so you won't spam same idea
+                key = f"{sym}:{sig['side']}:{TF}:{sig.get('color','')}"
                 if not cooldown_ok(state, key, now_ts):
                     continue
 
@@ -665,12 +933,8 @@ def scanner_loop() -> None:
                 sig["id"] = setup_id
                 sig["expires_ts"] = now_ts + (PENDING_TTL_MIN * 60)
 
-                # (optional) you can stop posting SETUP READY if you want less noise:
-                # tg_send(format_setup_ready(sig))
-
-                # We still count setups for daily report
-                state.setdefault("setups", []).append({"id": setup_id, "ts": now_ts})
-
+                # Count ONLY actionable (green/yellow) setups
+                state.setdefault("setups", []).append({"id": setup_id, "ts": now_ts, "color": sig.get("color","")})
                 state.setdefault("pending", {})[setup_id] = sig
 
                 mark_sent(state, key, now_ts)
@@ -685,4 +949,3 @@ def scanner_loop() -> None:
 
 if __name__ == "__main__":
     scanner_loop()
-
