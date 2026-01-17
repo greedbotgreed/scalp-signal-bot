@@ -8,18 +8,16 @@ from typing import List, Dict, Optional, Any, Tuple
 import requests
 
 # =========================
-# VERSIONING
+# VERSION
 # =========================
-BOT_VERSION = "v2026.01.13-c"
-CONFIG_ID = "lab_rejected_paper_v1"
-EXP_ID = "jan13c"
+VERSION = "v2026.01.17-a (v1 flow + traffic-light routing)"
 
 # =========================
 # CONFIG
 # =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()          # main channel id like -100...
-LAB_CHAT_ID = os.environ.get("LAB_CHAT_ID", "").strip()  # lab channel id like -100...
+CHAT_ID_SIGNALS = os.environ.get("CHAT_ID_SIGNALS", "").strip()  # main channel
+CHAT_ID_LAB = os.environ.get("CHAT_ID_LAB", "").strip()          # lab channel
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "2"))
 
 BYBIT_BASE = "https://api.bybit.com"
@@ -28,40 +26,25 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "TONUSDT"]
 
 # Base TF for setups
 TF = "15"              # 15m
-HTF = "60"             # 1h (higher timeframe filter)
-CHECK_EVERY_SEC = 60
+HTF = "60"             # 1h filter for scoring
+CHECK_EVERY_SEC = 20   # can be 20-60, doesn't matter, we gate by closed candle
 
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_LEN = 14
 ATR_LEN = 14
 
-# --- Filters / scoring thresholds ---
-MIN_EMA_GAP_PCT = 0.0015        # 0.15% gap between EMA20/50 (avoid flat)
-NEAR_EMA50_PCT = 0.0025         # price near EMA50 (pullback)
-MIN_ATR_PCT = 0.006             # ATR/price >= 0.6% (avoid dead market)
-EMA_SLOPE_LOOKBACK = 10         # bars for slope check
-EMA_SLOPE_MIN = 0.0006          # min slope magnitude (0.06% of price)
-MAX_FAST_EMA_CROSSES = 3        # too many crosses -> chop
-IMPULSE_ATR_MULT = 1.5          # last CLOSED candle range > 1.5*ATR -> impulse (risk)
-
-# RSI gates (basic)
+# --- Base v1 gates ---
+MIN_EMA_GAP_PCT = 0.0015        # 0.15%
+NEAR_EMA50_PCT = 0.0025         # pullback to EMA50
 RSI_LONG_MIN = 35
 RSI_SHORT_MAX = 65
 
-# Stops/targets (risk-based)
+# --- Stops/targets ---
 SL_ATR_MULT = 1.2
 TP1_R = 1.0
 TP2_R = 2.0
 TP3_R = 3.0
-
-# R gating for traffic light
-MIN_R_YELLOW = 1.8
-MIN_R_GREEN = 2.5
-
-# Score gating
-MIN_SCORE_YELLOW = 5
-MIN_SCORE_GREEN = 7
 
 # ==== SMART ENTRY (OFFSET BY ATR) ====
 OFFSET_MULT = {
@@ -75,8 +58,8 @@ OFFSET_MULT = {
 # If price doesn't touch the limit within this window -> NO FILL (skip, not SL)
 FILL_TTL_MIN = 45
 
-PENDING_TTL_MIN = 60
-COOLDOWN_MIN = 90
+PENDING_TTL_MIN = 90   # allow more time for confirm (v1-like flow)
+COOLDOWN_MIN = 60      # anti-spam for same symbol/side
 STATE_FILE = "state.json"
 
 DAILY_STATS_HOUR = 21
@@ -86,18 +69,38 @@ EVAL_TF = "1"
 HTTP_TIMEOUT = 12
 RETRY_SLEEP = 2.0
 
-# Post only GREEN/YELLOW (requested)
-POST_ONLY_GREEN_YELLOW = True
+# =========================
+# TRAFFIC LIGHT (v3-style but NOT too strict)
+# (you can tune later)
+# =========================
+MIN_ATR_PCT = 0.0045           # 0.45% (looser than 0.6% to avoid "0 setups")
+EMA_SLOPE_LOOKBACK = 10
+EMA_SLOPE_MIN = 0.00045        # looser
+MAX_FAST_EMA_CROSSES = 4       # looser
+IMPULSE_ATR_MULT = 1.6
+
+MIN_R_YELLOW = 1.6
+MIN_R_GREEN = 2.2
+
+MIN_SCORE_YELLOW = 5
+MIN_SCORE_GREEN = 7
+
+# We do NOT post candidates. We post only after CONFIRM.
+POST_ON_CONFIRM_ONLY = True
 
 # =========================
 # TELEGRAM
 # =========================
-def tg_send(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN or CHAT_ID env vars")
+def tg_send(chat_id: str, text: str) -> None:
+    if not BOT_TOKEN or not chat_id:
+        print("Missing BOT_TOKEN or chat_id")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
     try:
         r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
         if r.status_code != 200:
@@ -105,17 +108,11 @@ def tg_send(text: str) -> None:
     except Exception as e:
         print("Telegram exception:", e)
 
-def tg_send_lab(text: str) -> None:
-    if not BOT_TOKEN or not LAB_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": LAB_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-        if r.status_code != 200:
-            print("LAB Telegram error:", r.status_code, r.text[:300])
-    except Exception as e:
-        print("LAB Telegram exception:", e)
+def lab(text: str) -> None:
+    tg_send(CHAT_ID_LAB, text)
+
+def signals(text: str) -> None:
+    tg_send(CHAT_ID_SIGNALS, text)
 
 # =========================
 # STATE
@@ -124,24 +121,21 @@ def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
-            s.setdefault("last_sent", {})
-            s.setdefault("pending", {})     # setups waiting confirm
-            s.setdefault("trades", [])      # confirmed signals (some will become FILLED)
-            s.setdefault("setups", [])      # count actionable setups/day (🟢🟡 only)
-            s.setdefault("rejected", [])    # RED candidates (for LAB + paper eval)
-            s.setdefault("daily", {"last_stats_date": ""})
-            s.setdefault("paper", {"last_eval_date": ""})
-            return s
     except Exception:
-        return {
-            "last_sent": {},
-            "pending": {},
-            "trades": [],
-            "setups": [],
-            "rejected": [],
-            "daily": {"last_stats_date": ""},
-            "paper": {"last_eval_date": ""},
-        }
+        s = {}
+
+    s.setdefault("last_sent", {})          # cooldown by key
+    s.setdefault("pending", {})            # setups waiting confirm
+    s.setdefault("trades", [])             # confirmed signals (some become FILLED)
+    s.setdefault("setups_all", [])         # all candidates found (for lab stats)
+    s.setdefault("rejected_all", [])       # rejected candidates (for lab stats)
+    s.setdefault("daily", {"last_stats_date": ""})
+    s.setdefault("meta", {})
+    s["meta"]["version"] = VERSION
+
+    # gating by closed candle so we don't spam
+    s.setdefault("last_closed_t_ms", {})   # per symbol last processed closed candle
+    return s
 
 def save_state(state: Dict[str, Any]) -> None:
     try:
@@ -162,24 +156,27 @@ def mark_sent(state: Dict[str, Any], key: str, now_ts: int) -> None:
 # =========================
 def bybit_klines(symbol: str, interval: str, limit: int = 200) -> List[Dict[str, float]]:
     url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": str(limit)}
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": str(limit),
+    }
     for _ in range(3):
         try:
             r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
             if r.status_code != 200:
-                print("Bybit HTTP error", r.status_code, r.text[:200])
                 time.sleep(RETRY_SLEEP)
                 continue
             data = r.json()
             if data.get("retCode") != 0:
-                print("Bybit retCode error", data.get("retCode"), data.get("retMsg"))
                 time.sleep(RETRY_SLEEP)
                 continue
             raw = data["result"]["list"]
             candles = []
             for row in reversed(raw):
                 candles.append({
-                    "t": int(row[0]),
+                    "t": int(row[0]),         # ms
                     "o": float(row[1]),
                     "h": float(row[2]),
                     "l": float(row[3]),
@@ -240,43 +237,37 @@ def round_nice(x: float) -> float:
     return round(x, min(max(p, 2), 6))
 
 # =========================
-# HELPERS
+# TIME HELPERS
 # =========================
-def last_closed_candle(symbol: str, interval: str) -> Optional[Dict[str, float]]:
-    candles = bybit_klines(symbol, interval, limit=3)
-    if len(candles) < 3:
-        return None
-    return candles[-2]
+def local_now() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
 
-def ema_at_closed(symbol: str, interval: str, length: int) -> Optional[float]:
-    candles = bybit_klines(symbol, interval, limit=250)
+def yyyy_mm_dd(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+# =========================
+# CLOSED CANDLE ACCESS (ANTI-SPAM)
+# =========================
+def get_last_closed_15m(symbol: str) -> Optional[Tuple[Dict[str, float], List[Dict[str, float]]]]:
+    candles = bybit_klines(symbol, TF, limit=260)
     if len(candles) < 120:
         return None
-    closes = [c["c"] for c in candles]
-    e = ema(closes, length)
-    if not e or len(e) < 3:
-        return None
-    return float(e[-2])
+    # last closed candle is [-2]
+    return candles[-2], candles
 
-def atr_now(symbol: str, interval: str) -> Optional[float]:
-    candles = bybit_klines(symbol, interval, limit=250)
-    if len(candles) < 120:
-        return None
-    return atr(candles, ATR_LEN)
-
-def is_confirmed(sig: Dict[str, Any]) -> bool:
-    c = last_closed_candle(sig["symbol"], sig["tf"])
-    if not c:
-        return False
-    ef = ema_at_closed(sig["symbol"], sig["tf"], EMA_FAST)
-    if ef is None:
-        return False
-    close = float(c["c"])
+# =========================
+# CONFIRM CHECK (uses last closed candle)
+# =========================
+def is_confirmed(sig: Dict[str, Any], last_closed: Dict[str, float], ema_fast_closed: float) -> bool:
+    close = float(last_closed["c"])
     if sig["side"] == "LONG":
-        return close > ef
+        return close > ema_fast_closed
     else:
-        return close < ef
+        return close < ema_fast_closed
 
+# =========================
+# TRAFFIC LIGHT HELPERS
+# =========================
 def count_crosses(closes: List[float], ema_line: List[float], lookback: int = 30) -> int:
     if len(closes) < lookback + 2 or len(ema_line) < lookback + 2:
         return 0
@@ -301,7 +292,7 @@ def structure_ok_15m(candles: List[Dict[str, float]], side: str) -> bool:
         return (c1["h"] < c2["h"]) and (c1["l"] < c2["l"])
 
 def htf_trend(symbol: str) -> Optional[str]:
-    candles = bybit_klines(symbol, HTF, limit=250)
+    candles = bybit_klines(symbol, HTF, limit=260)
     if len(candles) < 120:
         return None
     closes = [c["c"] for c in candles]
@@ -309,9 +300,9 @@ def htf_trend(symbol: str) -> Optional[str]:
     es = ema(closes, EMA_SLOW)
     if not ef or not es:
         return None
-    if ef[-1] > es[-1]:
+    if ef[-2] > es[-2]:
         return "LONG"
-    if ef[-1] < es[-1]:
+    if ef[-2] < es[-2]:
         return "SHORT"
     return None
 
@@ -333,8 +324,8 @@ def r_potential(entry: float, sl: float, target: float) -> float:
 def market_is_choppy(price: float, candles: List[Dict[str, float]], ef_line: List[float], es_line: List[float], a: float) -> Tuple[bool, str]:
     if a / price < MIN_ATR_PCT:
         return True, "низька волатильність"
-    ef = ef_line[-1]
-    es = es_line[-1]
+    ef = ef_line[-2]
+    es = es_line[-2]
     ema_spread = abs(ef - es) / price
     if ema_spread < MIN_EMA_GAP_PCT:
         return True, "EMA злиплись"
@@ -342,86 +333,34 @@ def market_is_choppy(price: float, candles: List[Dict[str, float]], ef_line: Lis
     crosses = count_crosses(closes, ef_line, lookback=30)
     if crosses >= MAX_FAST_EMA_CROSSES:
         return True, "часті перетини EMA20"
-    if len(ef_line) > EMA_SLOPE_LOOKBACK + 2:
-        slope = (ef_line[-1] - ef_line[-(EMA_SLOPE_LOOKBACK+1)]) / price
+    if len(ef_line) > EMA_SLOPE_LOOKBACK + 3:
+        slope = (ef_line[-2] - ef_line[-(EMA_SLOPE_LOOKBACK+2)]) / price
         if abs(slope) < EMA_SLOPE_MIN:
             return True, "EMA20 без нахилу"
     return False, ""
 
-def last_closed_candle_impulse(candles: List[Dict[str, float]], a: float) -> bool:
-    # use last CLOSED candle
-    if not candles or a is None or len(candles) < 3:
+def last_closed_impulse(candles: List[Dict[str, float]], a: float) -> bool:
+    if len(candles) < 3 or a is None:
         return False
-    c = candles[-2]
+    c = candles[-2]  # last closed
     rng = float(c["h"] - c["l"])
     return rng > (IMPULSE_ATR_MULT * a)
 
-def compute_entry_zone_limit_proxy(symbol: str, side: str, tf: str) -> Optional[Tuple[float, float, float]]:
-    """
-    Proxy-confirm for RED (no real confirm):
-    use last CLOSED 15m close as entry_confirm to build zone/limit like real.
-    Returns (zone_low, zone_high, entry_limit).
-    """
-    c = last_closed_candle(symbol, tf)
-    if not c:
-        return None
-    entry_confirm = float(c["c"])
-    a = atr_now(symbol, tf)
-    if a is None:
-        return None
-    k = float(OFFSET_MULT.get(symbol, 0.35))
-    offset = a * k
+def grade_setup(sig: Dict[str, Any], candles: List[Dict[str, float]], ef_line: List[float], es_line: List[float], r_line: List[float], a: float) -> Dict[str, Any]:
+    # Use closed candle values
+    price = float(candles[-2]["c"])
+    ef = float(ef_line[-2])
+    es = float(es_line[-2])
+    rv = float(r_line[-2])
 
-    if side == "LONG":
-        zone_high = entry_confirm
-        zone_low = entry_confirm - offset
-        entry_limit = zone_low
-    else:
-        zone_low = entry_confirm
-        zone_high = entry_confirm + offset
-        entry_limit = zone_high
-
-    return (float(zone_low), float(zone_high), float(entry_limit))
-
-# =========================
-# SETUP LOGIC (TRAFFIC LIGHT)
-# =========================
-def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
-    candles = bybit_klines(symbol, TF, limit=250)
-    if len(candles) < 120:
-        return None
-
-    closes = [c["c"] for c in candles]
-    ef_line = ema(closes, EMA_FAST)
-    es_line = ema(closes, EMA_SLOW)
-    r_line = rsi(closes, RSI_LEN)
-    a = atr(candles, ATR_LEN)
-
-    if not ef_line or not es_line or not r_line or a is None:
-        return None
-
-    price = float(closes[-1])
-    ef = float(ef_line[-1])
-    es = float(es_line[-1])
-    rv = float(r_line[-1])
-
-    near_ema50 = abs(price - es) / price <= NEAR_EMA50_PCT
-    if not near_ema50:
-        return None
-
-    side = None
-    if ef > es and (RSI_LONG_MIN <= rv <= 60):
-        side = "LONG"
-    elif ef < es and (40 <= rv <= RSI_SHORT_MAX):
-        side = "SHORT"
-    else:
-        return None
+    side = sig["side"]
 
     chop, chop_reason = market_is_choppy(price, candles, ef_line, es_line, a)
-    htf_side = htf_trend(symbol)
+    htf_side = htf_trend(sig["symbol"])
     struct_ok = structure_ok_15m(candles, side)
-    impulse = last_closed_candle_impulse(candles, a)
+    impulse = last_closed_impulse(candles, a)
 
+    # SL and target (R potential)
     entry = price
     sl_dist = a * SL_ATR_MULT
     sl = entry - sl_dist if side == "LONG" else entry + sl_dist
@@ -437,39 +376,42 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
 
     if htf_side == side:
         score += 2
-        reasons.append("HTF ok")
+        reasons.append("HTF в ту ж сторону")
     else:
-        reasons.append("HTF mismatch")
+        reasons.append("HTF не підтверджує")
 
     if struct_ok:
         score += 2
-        reasons.append("structure ok")
+        reasons.append("структура ок")
     else:
-        reasons.append("structure weak")
+        reasons.append("структура слабка")
 
     score += 1
-    reasons.append("pullback EMA50")
+    reasons.append("відкат до EMA50")
 
     if (side == "LONG" and rv <= 60) or (side == "SHORT" and rv >= 40):
         score += 1
-        reasons.append("RSI ok")
+        reasons.append("RSI в нормі")
 
     if not impulse:
         score += 1
-        reasons.append("no impulse")
+        reasons.append("без імпульсу")
     else:
-        reasons.append("impulse risk")
+        reasons.append("імпульс (ризик)")
 
     if rp >= 3.0:
         score += 2
-        reasons.append(f"rp {rp:.1f} (3+)")
+        reasons.append(f"R потенціал {rp:.1f} (3+)")
     elif rp >= 2.0:
         score += 1
-        reasons.append(f"rp {rp:.1f}")
+        reasons.append(f"R потенціал {rp:.1f}")
 
     color = "RED"
     market_mode = "пилка/флет" if chop else "тренд/рух"
-    if not chop:
+
+    if chop:
+        color = "REJECTED"
+    else:
         if score >= MIN_SCORE_GREEN and rp >= MIN_R_GREEN:
             color = "GREEN"
         elif score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW:
@@ -477,43 +419,7 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
         else:
             color = "RED"
 
-    # reject_reason (for LAB diagnostics)
-    reject_reason = ""
-    if chop:
-        reject_reason = f"chop:{chop_reason}"
-    elif htf_side is not None and htf_side != side:
-        reject_reason = "htf_mismatch"
-    elif rp < MIN_R_YELLOW:
-        reject_reason = "rp_low"
-    elif score < MIN_SCORE_YELLOW:
-        reject_reason = "score_low"
-    elif impulse:
-        reject_reason = "impulse_risk"
-    else:
-        reject_reason = "red"
-
-    if side == "LONG":
-        reason = f"тренд вгору (EMA{EMA_FAST}>{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
-    else:
-        reason = f"тренд вниз (EMA{EMA_FAST}<{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
-
-    notes = []
-    if chop:
-        notes.append(f"🔴 Режим: {chop_reason}")
-    if impulse:
-        notes.append("⚠️ Імпульсна свічка: можливий хід проти")
-
     return {
-        "symbol": symbol,
-        "tf": TF,
-        "side": side,
-        "entry": round_nice(entry),
-        "sl": round_nice(sl),
-        "rsi": round(rv, 1),
-        "reason": reason,
-        "ts": int(time.time()),
-        "t_ms": int(candles[-1]["t"]),
-
         "color": color,
         "score": int(score),
         "r_potential": round(float(rp), 2),
@@ -522,12 +428,134 @@ def compute_setup(symbol: str) -> Optional[Dict[str, Any]]:
         "structure_ok": bool(struct_ok),
         "impulse": bool(impulse),
         "target_price": round_nice(float(target)) if target is not None else None,
-        "notes": notes,
-        "score_reasons": reasons,
-
-        "reject_reason": reject_reason,
+        "grade_reasons": reasons,
+        "chop_reason": chop_reason if chop else "",
+        "entry_ref": round_nice(entry),
+        "sl_ref": round_nice(sl),
     }
 
+# =========================
+# BASE v1 SETUP (FLOW GENERATOR)
+# - Uses CLOSED candle values only
+# =========================
+def compute_v1_candidate(symbol: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    got = get_last_closed_15m(symbol)
+    if not got:
+        return None
+    last_closed, candles = got
+
+    closed_t_ms = int(last_closed["t"])
+    last_seen = int(state.get("last_closed_t_ms", {}).get(symbol, 0))
+    if closed_t_ms <= last_seen:
+        return None  # no new closed candle
+
+    closes = [c["c"] for c in candles]
+    ef_line = ema(closes, EMA_FAST)
+    es_line = ema(closes, EMA_SLOW)
+    r_line = rsi(closes, RSI_LEN)
+    a = atr(candles, ATR_LEN)
+
+    if not ef_line or not es_line or not r_line or a is None:
+        state["last_closed_t_ms"][symbol] = closed_t_ms
+        save_state(state)
+        return None
+
+    price = float(last_closed["c"])
+    ef = float(ef_line[-2])
+    es = float(es_line[-2])
+    rv = float(r_line[-2])
+
+    gap_pct = abs(ef - es) / price
+    near_ema50 = abs(price - es) / price <= NEAR_EMA50_PCT
+
+    side = None
+    if gap_pct >= MIN_EMA_GAP_PCT and near_ema50:
+        if ef > es and (RSI_LONG_MIN <= rv <= 60):
+            side = "LONG"
+        elif ef < es and (40 <= rv <= RSI_SHORT_MAX):
+            side = "SHORT"
+
+    # mark processed closed candle
+    state["last_closed_t_ms"][symbol] = closed_t_ms
+
+    if not side:
+        # still useful for analysis? we keep only if you want; for now skip
+        save_state(state)
+        return None
+
+    # base SL (v1)
+    sl_dist = a * SL_ATR_MULT
+    sl = price - sl_dist if side == "LONG" else price + sl_dist
+
+    # cool-down by symbol/side to avoid duplicates
+    now_ts = int(time.time())
+    key = f"{symbol}:{side}:{TF}"
+    if not cooldown_ok(state, key, now_ts):
+        save_state(state)
+        return None
+
+    reason = (
+        f"тренд вгору (EMA{EMA_FAST}>{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
+        if side == "LONG"
+        else f"тренд вниз (EMA{EMA_FAST}<{EMA_SLOW}), відкат до EMA{EMA_SLOW}, RSI {rv:.0f}"
+    )
+
+    setup_id = f"{symbol}:{side}:{closed_t_ms}"
+    sig = {
+        "id": setup_id,
+        "symbol": symbol,
+        "tf": TF,
+        "side": side,
+        "entry": round_nice(price),   # reference (not limit)
+        "sl": round_nice(sl),
+        "rsi": round(rv, 1),
+        "reason": reason,
+        "ts": now_ts,
+        "closed_t_ms": closed_t_ms,
+        "expires_ts": now_ts + (PENDING_TTL_MIN * 60),
+    }
+
+    # grade it (traffic light), but DO NOT post yet
+    grade = grade_setup(sig, candles, ef_line, es_line, r_line, a)
+    sig.update(grade)
+
+    # log ALL candidates for lab daily stats
+    state.setdefault("setups_all", []).append({
+        "id": setup_id,
+        "ts": now_ts,
+        "symbol": symbol,
+        "side": side,
+        "color": sig.get("color", ""),
+        "score": sig.get("score", 0),
+        "rp": sig.get("r_potential", 0.0),
+        "reason": sig.get("chop_reason", "") if sig.get("color") == "REJECTED" else "",
+    })
+
+    # Route into buckets:
+    if sig["color"] == "REJECTED":
+        # don't spam, just store
+        state.setdefault("rejected_all", []).append({
+            "id": setup_id,
+            "ts": now_ts,
+            "symbol": symbol,
+            "side": side,
+            "why": sig.get("chop_reason", ""),
+            "score": sig.get("score", 0),
+            "rp": sig.get("r_potential", 0.0),
+        })
+        mark_sent(state, key, now_ts)
+        save_state(state)
+        return None
+
+    # For RED/YELLOW/GREEN we still wait confirmation (ENTRY CONFIRMED step)
+    state.setdefault("pending", {})[setup_id] = sig
+    mark_sent(state, key, now_ts)
+    save_state(state)
+    return sig
+
+# =========================
+# TARGETS
+# =========================
 def build_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
     risk = abs(entry - sl)
     if risk <= 0:
@@ -537,31 +565,139 @@ def build_targets(entry: float, sl: float, side: str) -> Tuple[float, float, flo
     return entry - risk * TP1_R, entry - risk * TP2_R, entry - risk * TP3_R
 
 # =========================
-# MESSAGE FORMAT
+# CONFIRM → TRADE (WITH OFFSET LIMIT)
+# - evaluated only on NEW CLOSED candle as well
 # =========================
-def traffic_block(color: str, score: int, rp: float, market_mode: str, impulse: bool) -> str:
-    if color == "GREEN":
-        badge = "🟢 Індикатор: зелений — можна працювати"
-    else:
-        badge = "🟡 Індикатор: жовтий — обережно"
-    warn = " | ⚠️ імпульс" if impulse else ""
-    return f"{badge}\nScore: {score}/10 | R потенціал: {rp:.2f} | Режим: {market_mode}{warn}"
+def process_pending(state: Dict[str, Any]) -> None:
+    now_ts = int(time.time())
+    pending = state.get("pending", {})
+    if not pending:
+        return
 
-def format_entry_confirmed_zone(tr: Dict[str, Any]) -> str:
+    to_delete = []
+
+    for pid, sig in list(pending.items()):
+        if now_ts > int(sig.get("expires_ts", 0)):
+            # expired w/o confirm
+            to_delete.append(pid)
+            # log to lab later in daily stats (no spam)
+            continue
+
+        symbol = sig["symbol"]
+
+        got = get_last_closed_15m(symbol)
+        if not got:
+            continue
+        last_closed, candles = got
+        closed_t_ms = int(last_closed["t"])
+
+        # confirm should happen only on candle after setup candle
+        if closed_t_ms <= int(sig.get("closed_t_ms", 0)):
+            continue
+
+        closes = [c["c"] for c in candles]
+        ef_line = ema(closes, EMA_FAST)
+        if not ef_line or len(ef_line) < 5:
+            continue
+        ema_fast_closed = float(ef_line[-2])
+
+        if not is_confirmed(sig, last_closed, ema_fast_closed):
+            continue
+
+        # confirmed close
+        entry_confirm = float(last_closed["c"])
+
+        # ATR now (using same candles, closed)
+        a = atr(candles, ATR_LEN)
+        if a is None:
+            continue
+
+        k = float(OFFSET_MULT.get(symbol, 0.35))
+        offset = a * k
+
+        if sig["side"] == "LONG":
+            zone_high = entry_confirm
+            zone_low = entry_confirm - offset
+            entry_limit = zone_low
+        else:
+            zone_low = entry_confirm
+            zone_high = entry_confirm + offset
+            entry_limit = zone_high
+
+        sl = float(sig["sl"])  # keep v1 SL reference
+        tp1, tp2, tp3 = build_targets(entry_limit, sl, sig["side"])
+
+        # trade object
+        tr = {
+            "id": pid,
+            "symbol": symbol,
+            "tf": sig["tf"],
+            "side": sig["side"],
+            "status": "CONFIRMED",
+
+            "entry_zone_low": round_nice(zone_low),
+            "entry_zone_high": round_nice(zone_high),
+            "entry_limit": round_nice(entry_limit),
+
+            "sl": round_nice(sl),
+            "tp1": round_nice(tp1),
+            "tp2": round_nice(tp2),
+            "tp3": round_nice(tp3),
+
+            "reason": sig.get("reason", ""),
+            "ts": now_ts,
+            "confirm_t_ms": closed_t_ms,
+
+            # traffic light from candidate grading
+            "color": sig.get("color", "RED"),
+            "score": int(sig.get("score", 0)),
+            "r_potential": float(sig.get("r_potential", 0.0)),
+            "market_mode": sig.get("market_mode", ""),
+            "impulse": bool(sig.get("impulse", False)),
+            "chop_reason": sig.get("chop_reason", ""),
+        }
+
+        state.setdefault("trades", []).append(tr)
+
+        # Route posting:
+        # - GREEN/YELLOW to Signals
+        # - RED to LAB only
+        msg = format_entry_confirmed(tr)
+
+        if tr["color"] in ("GREEN", "YELLOW"):
+            signals(msg)
+            lab("🧪 (copy) " + msg)
+        else:
+            lab("🔴 RED CONFIRMED (lab only)\n\n" + msg)
+
+        to_delete.append(pid)
+
+    for pid in to_delete:
+        pending.pop(pid, None)
+
+    save_state(state)
+
+def traffic_block(tr: Dict[str, Any]) -> str:
+    color = tr.get("color", "RED")
+    score = int(tr.get("score", 0))
+    rp = float(tr.get("r_potential", 0.0))
+    mode = tr.get("market_mode", "")
+    impulse = bool(tr.get("impulse", False))
+
+    if color == "GREEN":
+        badge = "🟢 Фільтр: зелений — ок"
+    elif color == "YELLOW":
+        badge = "🟡 Фільтр: жовтий — обережно"
+    else:
+        badge = "🔴 Фільтр: червоний — lab only"
+
+    warn = " | ⚠️ імпульс" if impulse else ""
+    return f"{badge}\nScore: {score}/10 | R потенціал: {rp:.2f} | Режим: {mode}{warn}"
+
+def format_entry_confirmed(tr: Dict[str, Any]) -> str:
     sym = tr["symbol"]
     side = "🟢 LONG" if tr["side"] == "LONG" else "🔴 SHORT"
     tf = tr["tf"]
-
-    color = tr.get("color", "YELLOW")
-    score = int(tr.get("score", 0))
-    rp = float(tr.get("r_potential", 0.0))
-    market_mode = tr.get("market_mode", "")
-    impulse = bool(tr.get("impulse", False))
-
-    extra_notes = tr.get("notes", [])
-    extra = ""
-    if extra_notes:
-        extra = "\n" + "\n".join(extra_notes)
 
     return (
         f"✅ ENTRY CONFIRMED | {sym} | {tf}m\n"
@@ -574,23 +710,19 @@ def format_entry_confirmed_zone(tr: Dict[str, Any]) -> str:
         f"TP3: {tr['tp3']}\n\n"
         f"Ризик: 1–2% (фікс)\n"
         f"Контекст: {tr.get('reason','')}\n\n"
-        f"{traffic_block(color, score, rp, market_mode, impulse)}"
-        f"{extra}\n"
+        f"{traffic_block(tr)}\n"
     )
 
 # =========================
-# TRADE FILL + OUTCOME (1m)
+# FILL + OUTCOME (1m)
 # =========================
 def is_limit_touched(tr: Dict[str, Any]) -> Optional[int]:
-    """
-    Returns fill_t_ms if limit touched after confirm candle (or proxy start), else None.
-    """
     symbol = tr["symbol"]
     side = tr["side"]
     limit_price = float(tr["entry_limit"])
     start_ms = int(tr.get("confirm_t_ms", 0))
 
-    candles = bybit_klines(symbol, EVAL_TF, limit=600)
+    candles = bybit_klines(symbol, EVAL_TF, limit=800)
     if not candles:
         return None
 
@@ -617,7 +749,7 @@ def eval_trade_hit_from(tr: Dict[str, Any], start_ms: int) -> str:
     tp2 = float(tr["tp2"])
     tp3 = float(tr["tp3"])
 
-    candles = bybit_klines(symbol, EVAL_TF, limit=800)
+    candles = bybit_klines(symbol, EVAL_TF, limit=1200)
     if not candles:
         return "OPEN"
 
@@ -667,7 +799,7 @@ def process_trade_fills(state: Dict[str, Any]) -> None:
 
     for tr in trades:
         status = tr.get("status", "CONFIRMED")
-        if status in ("FILLED", "NO_FILL", "CLOSED"):
+        if status in ("FILLED", "NO_FILL"):
             continue
 
         confirm_ts = int(tr.get("ts", 0))
@@ -689,16 +821,9 @@ def process_trade_fills(state: Dict[str, Any]) -> None:
         save_state(state)
 
 # =========================
-# TIME HELPERS
-# =========================
-def local_now() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
-
-def yyyy_mm_dd(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
-
-# =========================
-# DAILY STATS (MAIN)
+# DAILY STATS
+# - LAB: full stats (all candidates + rejected + red/yellow/green)
+# - SIGNALS: only posted (yellow/green confirmed)
 # =========================
 def send_daily_stats(state: Dict[str, Any]) -> None:
     today = yyyy_mm_dd(local_now())
@@ -710,27 +835,36 @@ def send_daily_stats(state: Dict[str, Any]) -> None:
     if (now.hour, now.minute) < (DAILY_STATS_HOUR, DAILY_STATS_MINUTE):
         return
 
+    # day boundaries in UTC seconds
     start_local = datetime(now.year, now.month, now.day, 0, 0, tzinfo=timezone.utc) - timedelta(hours=TZ_OFFSET_HOURS)
     end_local = start_local + timedelta(days=1)
     start_ts = int(start_local.timestamp())
     end_ts = int(end_local.timestamp())
 
-    setups_today = [s for s in state.get("setups", []) if start_ts <= int(s.get("ts", 0)) < end_ts]
+    setups_all = [s for s in state.get("setups_all", []) if start_ts <= int(s.get("ts", 0)) < end_ts]
+    rejected_all = [r for r in state.get("rejected_all", []) if start_ts <= int(r.get("ts", 0)) < end_ts]
     trades_today = [t for t in state.get("trades", []) if start_ts <= int(t.get("ts", 0)) < end_ts]
 
-    setups_found = len(setups_today)
-    confirmed = len(trades_today)
-    filled = len([t for t in trades_today if t.get("status") == "FILLED"])
-    no_fill = len([t for t in trades_today if t.get("status") == "NO_FILL"])
+    # CONFIRMED buckets
+    conf_green = [t for t in trades_today if t.get("color") == "GREEN"]
+    conf_yellow = [t for t in trades_today if t.get("color") == "YELLOW"]
+    conf_red = [t for t in trades_today if t.get("color") == "RED"]
 
+    # Posted to signals: only green/yellow
+    posted = conf_green + conf_yellow
+
+    # Filled / no fill
+    filled = [t for t in trades_today if t.get("status") == "FILLED"]
+    no_fill = [t for t in trades_today if t.get("status") == "NO_FILL"]
+
+    # Outcomes (only FILLED)
     sl = tp1 = tp2 = tp3 = open_ = 0
-    for t in trades_today:
-        if t.get("status") != "FILLED":
-            continue
+    sl_pub = tp1_pub = tp2_pub = tp3_pub = open_pub = 0
+
+    for t in filled:
         start_ms = int(t.get("fill_t_ms", 0)) or int(t.get("confirm_t_ms", 0))
         res = eval_trade_hit_from(t, start_ms)
         t["result"] = res
-
         if res == "SL":
             sl += 1
         elif res == "TP1":
@@ -742,256 +876,92 @@ def send_daily_stats(state: Dict[str, Any]) -> None:
         else:
             open_ += 1
 
-    if setups_found == 0:
-        text = (
+        # published outcomes subset
+        if t.get("color") in ("GREEN", "YELLOW"):
+            if res == "SL":
+                sl_pub += 1
+            elif res == "TP1":
+                tp1_pub += 1
+            elif res == "TP2":
+                tp2_pub += 1
+            elif res == "TP3":
+                tp3_pub += 1
+            else:
+                open_pub += 1
+
+    # summarize reject reasons
+    reasons = {}
+    for r in rejected_all:
+        why = r.get("why", "unknown")
+        reasons[why] = reasons.get(why, 0) + 1
+    reasons_line = ", ".join([f"{k}:{v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])]) or "-"
+
+    # LAB report (full)
+    lab_text = (
+        f"🧪 LAB Daily Report (21:00)\n"
+        f"Версія: {VERSION}\n\n"
+        f"Кандидатів (v1 flow) знайдено: {len(setups_all)}\n"
+        f"REJECTED (флет/вола/пилка): {len(rejected_all)}\n"
+        f"Причини REJECTED: {reasons_line}\n\n"
+        f"CONFIRMED всього: {len(trades_today)}\n"
+        f"  🟢 GREEN: {len(conf_green)}\n"
+        f"  🟡 YELLOW: {len(conf_yellow)}\n"
+        f"  🔴 RED: {len(conf_red)}\n\n"
+        f"FILLED: {len([t for t in filled])}\n"
+        f"NO_FILL: {len(no_fill)}\n\n"
+        f"Результати (тільки FILLED):\n"
+        f"❌ SL: {sl}\n"
+        f"✅ TP1: {tp1}\n"
+        f"✅ TP2: {tp2}\n"
+        f"✅ TP3: {tp3}\n"
+        f"⏳ В роботі: {open_}\n\n"
+        f"Нотатка: в TP/SL входять тільки FILLED (коли ціна доторкнулась limit)."
+    )
+    lab(lab_text)
+
+    # SIGNALS report (only published)
+    if len(posted) == 0:
+        sig_text = (
             "📊 Daily Report (21:00)\n"
             "Сетапів (🟢/🟡) не було.\n"
-            "Завтра продовжимо моніторинг."
+            "Продовжуємо моніторинг."
         )
     else:
-        text = (
+        sig_text = (
             "📊 Daily Report (21:00)\n"
-            f"Сетапів (🟢/🟡) знайдено: {setups_found}\n"
-            f"✅ Confirmed: {confirmed}\n"
-            f"🎯 Filled (limit touched): {filled}\n"
-            f"⏭ No fill (skip): {no_fill}\n\n"
-            f"❌ SL: {sl}\n"
-            f"✅ TP1: {tp1}\n"
-            f"✅ TP2: {tp2}\n"
-            f"✅ TP3: {tp3}\n"
-            f"⏳ В роботі: {open_}\n\n"
+            f"Опубліковано (🟢/🟡): {len(posted)}\n"
+            f"  🟢 GREEN: {len(conf_green)}\n"
+            f"  🟡 YELLOW: {len(conf_yellow)}\n\n"
+            f"FILLED: {len([t for t in filled if t.get('color') in ('GREEN','YELLOW')])}\n"
+            f"NO_FILL: {len([t for t in no_fill if t.get('color') in ('GREEN','YELLOW')])}\n\n"
+            f"Результати (тільки FILLED):\n"
+            f"❌ SL: {sl_pub}\n"
+            f"✅ TP1: {tp1_pub}\n"
+            f"✅ TP2: {tp2_pub}\n"
+            f"✅ TP3: {tp3_pub}\n"
+            f"⏳ В роботі: {open_pub}\n\n"
             "У TP/SL входять тільки FILLED (коли ціна доторкнулась limit)."
         )
+    signals(sig_text)
 
-    tg_send(text)
     state.setdefault("daily", {})["last_stats_date"] = today
     save_state(state)
 
 # =========================
-# PAPER EVAL FOR REJECTED (LAB)
-# =========================
-def process_rejected_paper_daily(state: Dict[str, Any]) -> None:
-    today = yyyy_mm_dd(local_now())
-    last = state.get("paper", {}).get("last_eval_date", "")
-    if last == today:
-        return
-
-    now = local_now()
-    if (now.hour, now.minute) < (DAILY_STATS_HOUR, DAILY_STATS_MINUTE):
-        return
-
-    start_local = datetime(now.year, now.month, now.day, 0, 0, tzinfo=timezone.utc) - timedelta(hours=TZ_OFFSET_HOURS)
-    end_local = start_local + timedelta(days=1)
-    start_ts = int(start_local.timestamp())
-    end_ts = int(end_local.timestamp())
-
-    rej = state.get("rejected", [])
-    todays = [r for r in rej if start_ts <= int(r.get("ts", 0)) < end_ts]
-
-    if not todays:
-        state.setdefault("paper", {})["last_eval_date"] = today
-        save_state(state)
-        return
-
-    total = len(todays)
-    no_fill = filled = 0
-    sl = tp1 = tp2 = tp3 = open_ = 0
-    by_reason: Dict[str, Dict[str, int]] = {}
-
-    for r in todays:
-        if r.get("paper_done"):
-            continue
-
-        tr_like = {
-            "symbol": r["symbol"],
-            "side": r["side"],
-            "entry_limit": r["entry_limit"],
-            "confirm_t_ms": int(r.get("t_ms", 0)),  # proxy start
-        }
-
-        fill_t_ms = is_limit_touched(tr_like)
-        if fill_t_ms is None:
-            r["paper_status"] = "NO_FILL"
-            r["paper_done"] = True
-            no_fill += 1
-            res = "NO_FILL"
-        else:
-            r["paper_status"] = "FILLED"
-            r["paper_fill_t_ms"] = int(fill_t_ms)
-            filled += 1
-
-            tr_eval = {
-                "symbol": r["symbol"],
-                "side": r["side"],
-                "sl": r["sl"],
-                "tp1": r["tp1"],
-                "tp2": r["tp2"],
-                "tp3": r["tp3"],
-            }
-            out = eval_trade_hit_from(tr_eval, int(fill_t_ms))
-            r["paper_result"] = out
-            r["paper_done"] = True
-            res = out
-
-            if out == "SL":
-                sl += 1
-            elif out == "TP1":
-                tp1 += 1
-            elif out == "TP2":
-                tp2 += 1
-            elif out == "TP3":
-                tp3 += 1
-            else:
-                open_ += 1
-
-        reason = (r.get("reject_reason") or "unknown")[:40]
-        by_reason.setdefault(reason, {"n": 0, "NO_FILL": 0, "FILLED": 0, "SL": 0, "TP1": 0, "TP2": 0, "TP3": 0, "OPEN": 0})
-        by_reason[reason]["n"] += 1
-        if res == "NO_FILL":
-            by_reason[reason]["NO_FILL"] += 1
-        elif res in ("SL", "TP1", "TP2", "TP3", "OPEN"):
-            by_reason[reason]["FILLED"] += 1
-            by_reason[reason][res] += 1
-
-    save_state(state)
-
-    lines = []
-    lines.append(f"🧪 LAB Paper Report (Rejected) | {today}")
-    lines.append(f"{BOT_VERSION} | {CONFIG_ID} | {EXP_ID}")
-    lines.append(f"Rejected: {total}")
-    lines.append(f"NO_FILL: {no_fill} | FILLED: {filled}")
-    if filled > 0:
-        lines.append(f"FILLED outcomes → SL:{sl} TP1:{tp1} TP2:{tp2} TP3:{tp3} OPEN:{open_}")
-
-    top = sorted(by_reason.items(), key=lambda kv: kv[1]["n"], reverse=True)[:3]
-    if top:
-        lines.append("")
-        lines.append("Top reject reasons:")
-        for reason, m in top:
-            lines.append(f"- {reason}: n={m['n']} | NO_FILL={m['NO_FILL']} | SL={m['SL']} TP1={m['TP1']} TP2={m['TP2']}")
-
-    tg_send_lab("\n".join(lines))
-
-    state.setdefault("paper", {})["last_eval_date"] = today
-    save_state(state)
-
-# =========================
-# PENDING → CONFIRMED (WITH ENTRY ZONE)
-# =========================
-def process_pending(state: Dict[str, Any]) -> None:
-    now_ts = int(time.time())
-    pending = state.get("pending", {})
-    if not pending:
-        return
-
-    to_delete = []
-    for pid, sig in list(pending.items()):
-        if now_ts > int(sig.get("expires_ts", 0)):
-            to_delete.append(pid)
-            continue
-
-        if not is_confirmed(sig):
-            continue
-
-        c = last_closed_candle(sig["symbol"], sig["tf"])
-        if not c:
-            continue
-
-        entry_confirm = float(c["c"])
-
-        a = atr_now(sig["symbol"], sig["tf"])
-        if a is None:
-            continue
-
-        k = float(OFFSET_MULT.get(sig["symbol"], 0.35))
-        offset = a * k
-
-        if sig["side"] == "LONG":
-            zone_high = entry_confirm
-            zone_low = entry_confirm - offset
-            entry_limit = zone_low
-        else:
-            zone_low = entry_confirm
-            zone_high = entry_confirm + offset
-            entry_limit = zone_high
-
-        sl = float(sig["sl"])
-        tp1, tp2, tp3 = build_targets(entry_limit, sl, sig["side"])
-
-        target_price = sig.get("target_price")
-        rp = float(sig.get("r_potential", 0.0))
-        if target_price is not None:
-            tp = float(target_price)
-            if (sig["side"] == "LONG" and tp > entry_limit) or (sig["side"] == "SHORT" and tp < entry_limit):
-                rp = r_potential(entry_limit, sl, tp)
-
-        score = int(sig.get("score", 0))
-        market_mode = sig.get("market_mode", "")
-        impulse = bool(sig.get("impulse", False))
-        color = sig.get("color", "YELLOW")
-
-        if color == "GREEN" and not (score >= MIN_SCORE_GREEN and rp >= MIN_R_GREEN):
-            color = "YELLOW" if (score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW) else "RED"
-        if color == "YELLOW" and not (score >= MIN_SCORE_YELLOW and rp >= MIN_R_YELLOW):
-            color = "RED"
-        if POST_ONLY_GREEN_YELLOW and color == "RED":
-            to_delete.append(pid)
-            continue
-
-        tr = {
-            "id": pid,
-            "symbol": sig["symbol"],
-            "tf": sig["tf"],
-            "side": sig["side"],
-            "status": "CONFIRMED",
-
-            "entry_zone_low": round_nice(zone_low),
-            "entry_zone_high": round_nice(zone_high),
-            "entry_limit": round_nice(entry_limit),
-
-            "sl": round_nice(sl),
-            "tp1": round_nice(tp1),
-            "tp2": round_nice(tp2),
-            "tp3": round_nice(tp3),
-
-            "reason": sig.get("reason", ""),
-            "ts": now_ts,
-            "confirm_t_ms": int(c["t"]),
-
-            "color": color,
-            "score": score,
-            "r_potential": round(float(rp), 2),
-            "market_mode": market_mode,
-            "impulse": impulse,
-            "notes": sig.get("notes", []),
-        }
-
-        state.setdefault("trades", []).append(tr)
-        tg_send(format_entry_confirmed_zone(tr))
-        to_delete.append(pid)
-
-    for pid in to_delete:
-        pending.pop(pid, None)
-
-    save_state(state)
-
-# =========================
-# MAIN LOOP
+# START / LOOP
 # =========================
 def announce_start() -> None:
     coins = "/".join([s.replace("USDT", "") for s in SYMBOLS])
-    tf = f"{TF}m"
-    tg_send(f"✅ Моніторинг активовано — {tf} сетапи (🟢🟡) по {coins}")
-    tg_send_lab(f"🧪 LAB активний | {BOT_VERSION} | {CONFIG_ID} | {EXP_ID}")
+    msg = f"✅ Моніторинг активовано — {TF}m по {coins}\nВерсія: {VERSION}"
+    lab("🧪 LAB активовано\n" + msg)
+    signals(msg)
 
 def scanner_loop() -> None:
     state = load_state()
     announce_start()
 
     while True:
-        now_ts = int(time.time())
-
-        # 1) confirm setups -> trades with entry zone
+        # 1) confirm pending -> route to signals/lab by color
         try:
             process_pending(state)
         except Exception as e:
@@ -1003,90 +973,16 @@ def scanner_loop() -> None:
         except Exception as e:
             print("process_trade_fills error:", e)
 
-        # 3) daily stats (main)
+        # 3) daily stats (lab + signals)
         try:
             send_daily_stats(state)
         except Exception as e:
             print("daily stats error:", e)
 
-        # 3b) daily paper evaluation for rejected (LAB)
-        try:
-            process_rejected_paper_daily(state)
-        except Exception as e:
-            print("paper rejected error:", e)
-
-        # 4) scan for new setups
+        # 4) scan new candidates only on NEW closed 15m candle
         for sym in SYMBOLS:
             try:
-                sig = compute_setup(sym)
-                if not sig:
-                    continue
-
-                color = sig.get("color", "RED")
-
-                # --- RED: store to LAB + state["rejected"], then continue ---
-                if color == "RED":
-                    z = compute_entry_zone_limit_proxy(sig["symbol"], sig["side"], sig["tf"])
-                    if z:
-                        zone_low, zone_high, entry_limit = z
-                        tp1, tp2, tp3 = build_targets(entry_limit, float(sig["sl"]), sig["side"])
-
-                        rid = f"{sig['symbol']}:{sig['side']}:{sig['t_ms']}:RED"
-                        rec = {
-                            "id": rid,
-                            "symbol": sig["symbol"],
-                            "tf": sig["tf"],
-                            "side": sig["side"],
-                            "ts": int(time.time()),
-                            "t_ms": int(sig["t_ms"]),
-
-                            "entry_limit": round_nice(entry_limit),
-                            "entry_zone_low": round_nice(zone_low),
-                            "entry_zone_high": round_nice(zone_high),
-
-                            "sl": round_nice(float(sig["sl"])),
-                            "tp1": round_nice(tp1),
-                            "tp2": round_nice(tp2),
-                            "tp3": round_nice(tp3),
-
-                            "score": int(sig.get("score", 0)),
-                            "r_potential": float(sig.get("r_potential", 0.0)),
-                            "reject_reason": sig.get("reject_reason", "") or "red",
-
-                            "paper_done": False,
-                        }
-
-                        state.setdefault("rejected", []).append(rec)
-                        save_state(state)
-
-                        tg_send_lab(
-                            f"🧪 REJECTED | {rec['symbol']} {rec['side']} | {rec['tf']}m\n"
-                            f"Причина: {rec['reject_reason']}\n"
-                            f"Score: {rec['score']} | Rp: {rec['r_potential']:.2f}\n"
-                            f"Zone: {rec['entry_zone_low']}–{rec['entry_zone_high']} | SL: {rec['sl']}"
-                        )
-                    continue
-
-                # 🟢🟡 only below (actionable)
-                if POST_ONLY_GREEN_YELLOW and color not in ("GREEN", "YELLOW"):
-                    continue
-
-                key = f"{sym}:{sig['side']}:{TF}:{color}"
-                if not cooldown_ok(state, key, now_ts):
-                    continue
-
-                setup_id = f"{sig['symbol']}:{sig['side']}:{sig['t_ms']}"
-                sig["id"] = setup_id
-                sig["expires_ts"] = now_ts + (PENDING_TTL_MIN * 60)
-
-                state.setdefault("setups", []).append({"id": setup_id, "ts": now_ts, "color": color})
-                state.setdefault("pending", {})[setup_id] = sig
-
-                mark_sent(state, key, now_ts)
-                save_state(state)
-
-                time.sleep(0.25)
-
+                compute_v1_candidate(sym, state)
             except Exception as e:
                 print("scan error:", sym, e)
 
